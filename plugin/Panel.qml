@@ -20,6 +20,9 @@ Panel {
   property var state: ({})
   property bool busy: false
   property string action: ""
+  property string lastError: ""
+  property bool confirmAdd: false
+  property bool confirmDaemon: false
 
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
   readonly property bool daemonUp: state.daemon === true
@@ -35,11 +38,32 @@ Panel {
     ? Qt.rgba(0.95, 0.4, 0.35, 0.9)
     : connected ? Commons.Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
 
+  function resetConfirms() {
+    root.confirmAdd = false
+    root.confirmDaemon = false
+  }
+
+  function addUri() {
+    var t = uriInput.text.trim()
+    if (t === "" || busy) return
+    if (!confirmAdd) {
+      confirmAdd = true
+      addConfirmTimer.restart()
+      return
+    }
+    // http(s)-ссылка = подписка (subacone-like), остальное = ссылка сервера
+    var isSub = t.indexOf("http://") === 0 || t.indexOf("https://") === 0
+    act(isSub ? ["subscribe", "add", t] : ["server", "add", t])
+    uriInput.text = ""
+  }
+
   function refresh() { if (!procState.running) procState.running = true }
 
   function act(args) {
     if (busy) return
     busy = true
+    lastError = ""
+    resetConfirms()
     action = String(args[0] || "")
     procAct.command = [root.cli].concat(args)
     procAct.running = true
@@ -66,6 +90,12 @@ Panel {
         root.busy = false
         root.action = ""
         root.refresh()
+      }
+    }
+    stderr: StdioCollector {
+      onStreamFinished: {
+        var t = String(text || "").trim()
+        if (t !== "") root.lastError = t
       }
     }
     onExited: (code) => {
@@ -186,7 +216,7 @@ Panel {
         Text {
           visible: root.servers.length === 0
           width: parent.width
-          text: "нет серверов — добавь: omaxy server add <uri>"
+          text: "нет серверов — добавь ссылку ниже"
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -222,12 +252,81 @@ Panel {
           horizontalAlignment: Text.AlignRight
           elide: Text.ElideRight
           text: root.busy ? root.action
-            : (!root.daemonUp ? "нужен omaxyd (systemd)"
+            : root.lastError !== "" ? root.lastError
+            : (!root.daemonUp ? "демон не запущен"
                : root.connected && root.active.name ? root.active.name : "—")
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.65)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
+      }
+
+      // ── запуск демона (если не поднят): два нажатия = подтверждение,
+      //    далее polkit-диалог (или systemctl без пароля, если юнит уже установлен)
+      Button {
+        visible: !root.daemonUp
+        width: parent.width
+        text: root.confirmDaemon
+          ? "запустить демон от root — подтвердить?"
+          : "⏻ запустить демон"
+        fontSize: Style.font.bodySmall
+        foreground: root.confirmDaemon ? Commons.Color.accent : root.fg
+        accent: Commons.Color.accent
+        bordered: true
+        horizontalPadding: Style.space(10)
+        verticalPadding: Style.space(2)
+        enabled: !root.busy
+        onClicked: {
+          if (!root.confirmDaemon) {
+            root.confirmDaemon = true
+            daemonConfirmTimer.restart()
+            return
+          }
+          root.act(["daemon", "ensure"])
+        }
+      }
+
+      Timer {
+        id: daemonConfirmTimer
+        interval: 5000
+        onTriggered: root.confirmDaemon = false
+      }
+
+      // ── зона ввода URI с подтверждением
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        TextField {
+          id: uriInput
+          width: parent.width - uriAddBtn.implicitWidth - parent.spacing
+          placeholderText: "ссылка vless://… или подписка https://…"
+          font.pixelSize: Style.font.bodySmall
+          foreground: root.fg
+          accent: Commons.Color.accent
+          verticalPadding: Style.space(2)
+          onAccepted: root.addUri()
+          onTextChanged: root.confirmAdd = false
+        }
+
+        Button {
+          id: uriAddBtn
+          text: root.confirmAdd ? "подтвердить?" : "Добавить"
+          fontSize: Style.font.bodySmall
+          foreground: root.confirmAdd ? Commons.Color.accent : root.fg
+          accent: Commons.Color.accent
+          bordered: true
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(2)
+          enabled: !root.busy && uriInput.text.trim().length > 0
+          onClicked: root.addUri()
+        }
+      }
+
+      Timer {
+        id: addConfirmTimer
+        interval: 5000
+        onTriggered: root.confirmAdd = false
       }
     }
   }

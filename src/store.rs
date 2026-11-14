@@ -105,13 +105,34 @@ impl Config {
     }
 }
 
+/// Stable device HWID, Happ-style: 16 lowercase hex chars from the machine id
+/// (sha256 truncated). Panels (Remnawave/Subacone & co) gate subscriptions on
+/// the x-hwid header and count devices by it.
+pub fn hwid() -> String {
+    let mi = ["/var/lib/dbus/machine-id", "/etc/machine-id"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| "omaxy-fallback-device".to_string());
+    // hash raw file bytes (incl. trailing \n) to match `sha256sum machine-id`
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(mi.as_bytes());
+    h.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Fetch a subscription URL: link list (base64 or plaintext) or JSON array.
 pub fn fetch_subscription(url: &str) -> Result<Vec<Server>, String> {
     let resp = ureq::get(url)
-        .set("User-Agent", "clash-verge/1.0") // many panels gate by UA
+        .set("User-Agent", "Happ/4.7.2") // Happ-family panels gate by UA + HWID headers
+        .set("x-hwid", &hwid())
+        .set("x-device-os", "Linux")
+        .set("x-device-model", "omaxy")
         .timeout(std::time::Duration::from_secs(20))
         .call()
         .map_err(|e| format!("fetch failed: {e}"))?;
+    let hwid_flag = resp
+        .header("x-hwid-not-supported")
+        .unwrap_or("")
+        .to_string();
     let body = resp.into_string().map_err(|e| e.to_string())?;
     let mut uris: Vec<String> = Vec::new();
     let trimmed = body.trim();
@@ -147,10 +168,21 @@ pub fn fetch_subscription(url: &str) -> Result<Vec<Server>, String> {
     let mut servers = Vec::new();
     for u in uris {
         if let Ok(s) = crate::links::from_uri(&u) {
+            // HWID-gate decoys from Happ-family panels: 0.0.0.0:1 with hint names
+            if s.address == "0.0.0.0" {
+                continue;
+            }
             servers.push(s);
         }
     }
     if servers.is_empty() {
+        if body.contains("HWID") {
+            return Err(if hwid_flag == "true" {
+                "панель не принимает HWID от этого клиента (список приложений ограничен)".into()
+            } else {
+                "панель требует включить HWID на подписке (проверьте бота/кабинет провайдера)".into()
+            });
+        }
         return Err("subscription: no parsable links found".into());
     }
     Ok(servers)

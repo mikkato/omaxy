@@ -88,8 +88,19 @@ fn main() {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
     let res: Result<(), String> = match cmd {
         "daemon" => {
-            let d = daemon::Daemon::new(socket_path());
-            d.run().map_err(|e| format!("daemon: {e}"))
+            if args.get(1).map(|s| s.as_str()) == Some("ensure") {
+                cli_daemon_ensure()
+            } else {
+                let daemonize = args.iter().any(|a| a == "--daemonize");
+                if daemonize {
+                    if let Err(e) = daemonize_into_log() {
+                        eprintln!("daemonize: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                let d = daemon::Daemon::new(socket_path());
+                d.run().map_err(|e| format!("daemon: {e}"))
+            }
         }
         "server" => cli_server(&args[1..]),
         "subscribe" => cli_subscribe(&args[1..]),
@@ -381,4 +392,101 @@ fn cli_qr(args: &[String]) -> Result<(), String> {
         }
     }
     Err("QR не найден".into())
+}
+
+/// Double-fork detach so pkexec/systemd-run can return while the daemon lives on.
+fn daemonize_into_log() -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return Err("fork".into());
+        }
+        if pid > 0 {
+            // first parent (pkexec's child) returns immediately; daemon lives in the child
+            std::process::exit(0);
+        }
+    }
+    // We are the child: new session, second fork to drop session leadership.
+    unsafe { libc::setsid() };
+    unsafe {
+        if libc::fork() < 0 {
+            std::process::exit(1);
+        }
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/var/log/omaxyd.log")
+        .or_else(|_| OpenOptions::new().create(true).append(true).open("/tmp/omaxyd.log"))
+        .map_err(|e| e.to_string())?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+    let devnull = std::fs::File::open("/dev/null").map_err(|e| e.to_string())?;
+    unsafe {
+        libc::dup2(devnull.as_raw_fd(), 0);
+        libc::dup2(log.as_raw_fd(), 1);
+        libc::dup2(log_err.as_raw_fd(), 2);
+    }
+    Ok(())
+}
+
+/// Start the daemon on demand: systemd unit if installed, else pkexec self-spawn.
+fn cli_daemon_ensure() -> Result<(), String> {
+    if Conn::open().is_ok() {
+        println!("демон уже работает");
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.to_string_lossy().to_string();
+    // 1) установленный unit (unit uses OMAXY_SOCK; probe it before claiming failure)
+    let unit = std::process::Command::new("systemctl")
+        .args(["cat", "omaxyd.service"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if unit {
+        let st = std::process::Command::new("systemctl")
+            .args(["start", "omaxyd.service"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if st.success() && wait_daemon() {
+            println!("демон запущен (omaxyd.service)");
+            return Ok(());
+        }
+        let st = std::process::Command::new("pkexec")
+            .args(["systemctl", "start", "omaxyd.service"])
+            .status()
+            .map_err(|e| format!("pkexec: {e}"))?;
+        if st.success() && wait_daemon() {
+            println!("демон запущен (omaxyd.service, polkit)");
+            return Ok(());
+        }
+    }
+    // 2) unit нет — detach-запуск себя под root через polkit
+    let st = std::process::Command::new("pkexec")
+        .args([&exe, "daemon", "--daemonize"])
+        .status()
+        .map_err(|e| format!("pkexec: {e}"))?;
+    if !st.success() {
+        return Err("не удалось получить root (polkit отклонён?)".into());
+    }
+    if wait_daemon() {
+        println!("демон запущен (pkexec, лог: /var/log/omaxyd.log или /tmp/omaxyd.log)");
+        Ok(())
+    } else {
+        Err("pkexec прошёл, но демон не отвечает".into())
+    }
+}
+
+fn wait_daemon() -> bool {
+    for _ in 0..40 {
+        if Conn::open().is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }

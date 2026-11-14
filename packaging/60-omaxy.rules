@@ -1,0 +1,8 @@
+// omaxy: разрешить pkexec-запуск демона с графическим подтверждением админом.
+polkit.addRule(function(action, subject) {
+  if (action.id === "org.freedesktop.policykit.exec" &&
+      (action.lookup("program") === "/usr/local/bin/omaxy" ||
+       action.lookup("program") === "/usr/bin/omaxy")) {
+    return polkit.Result.AUTH_ADMIN; // диалог пароля на каждом запуске (не keep)
+  }
+});
