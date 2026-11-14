@@ -54,6 +54,11 @@ pub fn build(server: &Server, st: &Settings, with_tun: bool) -> Value {
         rules.push(json!({"type":"field","inboundTag":["tun-in"],"network":"udp",
                           "port":"53","outboundTag":"dns-out"}));
     }
+    if !with_tun {
+        // режим singbox: собственный DNS xray должен ходить НАПРЯМУЮ, иначе
+        // резолв адреса сервера уходит в туннель и зацикливается (record not found)
+        rules.push(json!({"type":"field","network":"udp","port":"53","outboundTag":"direct"}));
+    }
     if st.route_mode != "global" {
         rules.push(json!({"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","::1/128","fc00::/7","fe80::/10"],"outboundTag":"direct"}));
         rules.push(json!({"type":"field","domain":["^domain:\\.(lan|local)$","geoip:private"],"outboundTag":"direct"}));
@@ -292,8 +297,15 @@ pub fn build_singbox(st: &Settings, iface: &str) -> Value {
             "auto_detect_interface": true,
             "rules": [
                 { "process_name": if st.direct_apps.is_empty() {
-                        vec!["omaxy".to_string(), "xray".to_string(), "sing-box".to_string()]
+                        vec!["omaxy".to_string(), "xray".to_string(),
+                             "sing-box".to_string(), "hermes".to_string()]
                     } else { st.direct_apps.clone() },
+                  "outbound": "direct" },
+                // весь Hermes и его бэкенды (python/всё из ~/.hermes) — мимо туннеля,
+                // связь с моделью не должна зависеть от состояния прокси
+                { "process_path_regex": format!(
+                    "^{}/\\.hermes/",
+                    std::env::var("HOME").unwrap_or_else(|_| "/home/mikkato".into())),
                   "outbound": "direct" },
                 { "action": "sniff" },
                 { "protocol": "dns", "action": "hijack-dns" }

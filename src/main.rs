@@ -281,6 +281,15 @@ fn cli_subscribe(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn resolve_ipv4(host: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    (host, 443u16)
+        .to_socket_addrs()
+        .ok()?
+        .find(|a| a.is_ipv4())
+        .map(|a| a.ip().to_string())
+}
+
 fn cli_connect(args: &[String]) -> Result<(), String> {
     let cfg = store::load();
     let sel = args.first().cloned().or_else(|| cfg.active.clone());
@@ -289,6 +298,18 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
         None => cfg.all_servers().first().map(|s| (*s).clone()),
     }
     .ok_or("сервер не найден; список: omaxy server list")?;
+    // детерминизм: адрес сервера резолвим СЕЙЧАС на клиенте (туннеля ещё нет)
+    // и передаём в конфиг IP — xray не должен резолвить домен сервера сам,
+    // иначе в singbox-режиме резолв уходит в туннель и зацикливается
+    let mut server = server;
+    if server.address.parse::<std::net::IpAddr>().is_err() {
+        if let Some(ip) = resolve_ipv4(&server.address) {
+            if server.sni.is_none() {
+                server.sni = Some(server.address.clone());
+            }
+            server.address = ip;
+        }
+    }
     if !std::path::Path::new(&cfg.settings.xray_path).exists() {
         return Err(format!(
             "xray не найден: {} — установи (pacman -S xray) или укажи путь: omaxy config set xray_path <path>",
