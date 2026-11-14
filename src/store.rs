@@ -26,6 +26,13 @@ pub struct Settings {
     pub xray_path: String,
     pub tun_address: String,
     pub tun_gateway: String,
+    /// включать TUN-inbound (режим «всё через туннель»); false — только socks/http
+    #[serde(default = "default_true")]
+    pub tun: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -38,6 +45,7 @@ impl Default for Settings {
             xray_path: "/usr/bin/xray".into(),
             tun_address: "10.77.0.1/30".into(),
             tun_gateway: "10.77.0.2".into(),
+            tun: true,
         }
     }
 }

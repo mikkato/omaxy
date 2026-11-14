@@ -126,6 +126,7 @@ fn main() {
         "status" => cli_status(&args[1..]),
         "qr" => cli_qr(&args[1..]),
         "ping" => cli_ping(&args[1..]),
+        "config" => cli_config(&args[1..]),
         "call" => cli_call(&args[1..]),
         _ => {
             println!(
@@ -278,7 +279,7 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
     if server.kind == links::ServerKind::Hysteria2 {
         return Err("hysteria2 в генераторе xray-конфига пока не поддерживается".into());
     }
-    let conf = xrayconf::build(&server, &cfg.settings, true);
+    let conf = xrayconf::build(&server, &cfg.settings, cfg.settings.tun);
     let conf_str = serde_json::to_string_pretty(&conf).unwrap();
     let mut c = Conn::open()?;
     let put = c.call(json!({
@@ -341,6 +342,7 @@ fn cli_status(args: &[String]) -> Result<(), String> {
         })
         .collect();
     let mut out = json!({"daemon": false, "connected": false, "servers": servers,
+                         "settings": serde_json::to_value(&cfg.settings).unwrap_or(json!({})),
                          "subscriptions": cfg.subscriptions.iter().map(|x| json!({"id":x.id,"name":x.name,"count":x.servers.len()})).collect::<Vec<_>>()});
     if let Ok(mut c) = Conn::open() {
         if let Ok(r) = c.call(json!({"action": "omaxy-status", "request-id": 5})) {
@@ -360,6 +362,7 @@ fn cli_status(args: &[String]) -> Result<(), String> {
                 "connected": running,
                 "active": read_active(),
                 "traffic": read_traffic(),
+                "settings": serde_json::to_value(&cfg.settings).unwrap_or(json!({})),
                 "servers": servers,
                 "subscriptions": out["subscriptions"].clone(),
                 "processes": r.get("processes").cloned().unwrap_or(json!([]))
@@ -558,4 +561,90 @@ fn wait_daemon() -> bool {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     false
+}
+
+/// omaxy config                     — print settings JSON
+/// omaxy config set <k> <v> [...]   — set settings; reconnects live xray if active
+fn cli_config(args: &[String]) -> Result<(), String> {
+    match args.first().map(|s| s.as_str()).unwrap_or("get") {
+        "get" => {
+            let cfg = store::load();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::to_value(&cfg.settings).unwrap()).unwrap()
+            );
+            Ok(())
+        }
+        "set" => {
+            let mut cfg = store::load();
+            let pairs = &args[1..];
+            if pairs.len() % 2 != 0 {
+                return Err("usage: omaxy config set <key> <value> [<key> <value> …]".into());
+            }
+            let mut changed_keys = Vec::new();
+            let mut i = 0;
+            while i < pairs.len() {
+                let (k, v) = (&pairs[i], pairs[i + 1].as_str());
+                i += 2;
+                let res: Result<(), String> = match k.as_str() {
+                    "socks_port" => v.parse::<u16>().map(|p| cfg.settings.socks_port = p).map_err(|e| e.to_string()),
+                    "http_port" => v.parse::<u16>().map(|p| cfg.settings.http_port = p).map_err(|e| e.to_string()),
+                    "dns" => {
+                        cfg.settings.dns = v
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        Ok(())
+                    }
+                    "route_mode" => {
+                        if v == "direct-local" || v == "global" {
+                            cfg.settings.route_mode = v.to_string();
+                            Ok(())
+                        } else {
+                            Err("route_mode: direct-local | global".to_string())
+                        }
+                    }
+                    "tun" => v.parse::<bool>().map(|b| cfg.settings.tun = b).map_err(|e| e.to_string()),
+                    "tun_address" => {
+                        if store_valid_v4(v.split('/').next().unwrap_or("")) {
+                            cfg.settings.tun_address = v.to_string();
+                            Ok(())
+                        } else {
+                            Err("невалидный IPv4/CIDR".to_string())
+                        }
+                    }
+                    "tun_gateway" => {
+                        if store_valid_v4(v) {
+                            cfg.settings.tun_gateway = v.to_string();
+                            Ok(())
+                        } else {
+                            Err("невалидный IPv4".to_string())
+                        }
+                    }
+                    "xray_path" => {
+                        cfg.settings.xray_path = v.to_string();
+                        Ok(())
+                    }
+                    other => Err(format!("неизвестный ключ: {other}")),
+                };
+                res.map_err(|e| format!("{k}: {e}"))?;
+                changed_keys.push(k.clone());
+            }
+            store::save(&cfg)?;
+            println!("сохранено: {}", changed_keys.join(", "));
+            // настройки применяются к запущенному xray только перезапуском
+            if cfg.active.is_some() && Conn::open().is_ok() {
+                println!("перезапуск подключения…");
+                cli_disconnect()?;
+                cli_connect(&[])?;
+            }
+            Ok(())
+        }
+        _ => Err("usage: omaxy config [get | set <k> <v> …]".into()),
+    }
+}
+
+fn store_valid_v4(s: &str) -> bool {
+    !s.is_empty() && s.split('.').count() == 4 && s.split('.').all(|o| o.parse::<u8>().is_ok())
 }

@@ -53,7 +53,9 @@ max-restart-attempts, restart-delay-ms` + **расширение `detached:true`
 - [x] ссылки vless/vmess/trojan/ss (+hy2 парсинг, конфиг-генерация hy2 — TODO)
 - [x] подписки (base64-список / JSON)
 - [x] декод ссылок из QR-картинки (`omaxy qr`)
-- [x] QML-модуль панели Omarchy
+- [x] QML-модуль панели Omarchy: список с прокруткой и TCP-пингом, круговые
+      диаграммы трафика (R/TX), зоны ввода ссылки/подписки с подтверждением,
+      запуск демона через polkit, редактор настроек (режим, порты, DNS, TUN)
 - [x] GUI omaxy-gui (Slint, тёмная тема, Wayland-нативный)
 - [ ] конфиг-генерация hysteria2, routing-правила geosite, per-app routing
 

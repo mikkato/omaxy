@@ -36,6 +36,17 @@ Panel {
   property bool pingBusy: false
   property string pingCurrent: ""
 
+  // настройки прокси (омaxy Settings) — черновик для редактирования
+  property bool cfgOpen: false
+  property string cfgRoute: "direct-local"
+  property bool cfgTun: true
+  property string cfgSocks: "10808"
+  property string cfgHttp: "10809"
+  property string cfgDns: ""
+  property string cfgAddr: ""
+  property string cfgGw: ""
+  property bool confirmApply: false
+
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
   readonly property bool daemonUp: state.daemon === true
   readonly property bool connected: state.connected === true
@@ -109,6 +120,35 @@ Panel {
     procPing.running = true
   }
 
+  function fillCfg() {
+    var s = root.state.settings || {}
+    cfgRoute = s.route_mode || "direct-local"
+    cfgTun = s.tun !== false
+    cfgSocks = String(s.socks_port || 10808)
+    cfgHttp = String(s.http_port || 10809)
+    cfgDns = (s.dns || []).join(", ")
+    cfgAddr = s.tun_address || ""
+    cfgGw = s.tun_gateway || ""
+    confirmApply = false
+  }
+
+  function applyCfg() {
+    if (!confirmApply) {
+      confirmApply = true
+      applyConfirmTimer.restart()
+      return
+    }
+    var dns = cfgDns.split(",").map(function (x) { return x.trim() }).filter(Boolean).join(",")
+    act(["config", "set",
+      "route_mode", cfgRoute,
+      "tun", cfgTun ? "true" : "false",
+      "socks_port", cfgSocks,
+      "http_port", cfgHttp,
+      "dns", dns,
+      "tun_address", cfgAddr,
+      "tun_gateway", cfgGw])
+  }
+
   function refresh() { if (!procState.running) procState.running = true }
 
   function act(args) {
@@ -148,7 +188,10 @@ Panel {
   }
 
   onOpenedChanged: {
-    if (opened) refresh()
+    if (opened) {
+      refresh()
+      Qt.callLater(fillCfg)
+    }
   }
 
   Process {
@@ -378,6 +421,163 @@ Panel {
         id: addConfirmTimer
         interval: 5000
         onTriggered: root.confirmAdd = false
+      }
+
+      // ── настройки прокси (Settings из исходников omaxy)
+      Button {
+        width: parent.width
+        text: root.cfgOpen ? "⚙ настройки прокси ▴" : "⚙ настройки прокси ▾"
+        fontSize: Style.font.bodySmall
+        foreground: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.75)
+        accent: Commons.Color.accent
+        bordered: true
+        horizontalPadding: Style.space(10)
+        verticalPadding: Style.space(2)
+        onClicked: {
+          root.cfgOpen = !root.cfgOpen
+          if (root.cfgOpen) root.fillCfg()
+        }
+      }
+
+      Column {
+        visible: root.cfgOpen
+        width: parent.width
+        spacing: Style.space(6)
+
+        // режим маршрутизации
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          Repeater {
+            model: [
+              { key: "direct-local", label: "локальное напрямую" },
+              { key: "global", label: "всё через прокси" }
+            ]
+            Button {
+              required property var modelData
+              width: (col.width - Style.space(6)) / 2
+              text: (root.cfgRoute === modelData.key ? "● " : "○ ") + modelData.label
+              fontSize: Style.font.caption
+              foreground: root.cfgRoute === modelData.key
+                ? Commons.Color.accent
+                : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.65)
+              accent: Commons.Color.accent
+              bordered: true
+              horizontalPadding: Style.space(4)
+              verticalPadding: Style.space(2)
+              onClicked: root.cfgRoute = modelData.key
+            }
+          }
+        }
+
+        // режим портов + TUN
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Button {
+            text: (root.cfgTun ? "● " : "○ ") + "TUN-режим"
+            fontSize: Style.font.caption
+            foreground: root.cfgTun ? Commons.Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.65)
+            accent: Commons.Color.accent
+            bordered: true
+            verticalPadding: Style.space(2)
+            onClicked: root.cfgTun = !root.cfgTun
+          }
+
+          Row {
+            spacing: Style.space(4)
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "socks"
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+              font.pixelSize: Style.font.caption
+              font.family: Style.font.family
+            }
+            TextField {
+              width: Style.space(52)
+              text: root.cfgSocks
+              font.pixelSize: Style.font.caption
+              verticalPadding: 0
+              onTextChanged: root.cfgSocks = text
+            }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "http"
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+              font.pixelSize: Style.font.caption
+              font.family: Style.font.family
+            }
+            TextField {
+              width: Style.space(52)
+              text: root.cfgHttp
+              font.pixelSize: Style.font.caption
+              verticalPadding: 0
+              onTextChanged: root.cfgHttp = text
+            }
+          }
+        }
+
+        TextField {
+          width: parent.width
+          placeholderText: "DNS, через запятую"
+          text: root.cfgDns
+          font.pixelSize: Style.font.caption
+          verticalPadding: Style.space(1)
+          onTextChanged: root.cfgDns = text
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          TextField {
+            width: (parent.width - Style.space(6)) / 2
+            placeholderText: "адрес TUN (CIDR)"
+            text: root.cfgAddr
+            font.pixelSize: Style.font.caption
+            verticalPadding: Style.space(1)
+            onTextChanged: root.cfgAddr = text
+          }
+          TextField {
+            width: (parent.width - Style.space(6)) / 2
+            placeholderText: "шлюз TUN"
+            text: root.cfgGw
+            font.pixelSize: Style.font.caption
+            verticalPadding: Style.space(1)
+            onTextChanged: root.cfgGw = text
+          }
+        }
+
+        Button {
+          width: parent.width
+          text: root.confirmApply
+            ? "применить и перезапустить подключение — подтвердить?"
+            : "Применить"
+          fontSize: Style.font.bodySmall
+          foreground: root.confirmApply ? Commons.Color.accent : root.fg
+          accent: Commons.Color.accent
+          bordered: true
+          verticalPadding: Style.space(2)
+          enabled: !root.busy
+          onClicked: root.applyCfg()
+        }
+
+        Timer {
+          id: applyConfirmTimer
+          interval: 5000
+          onTriggered: root.confirmApply = false
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: root.cfgTun
+            ? "TUN: весь трафик идёт через omaxy0; выкл — только SOCKS/HTTP на локальных портах"
+            : " SOCKS " + root.cfgSocks + " · HTTP " + root.cfgHttp + " — приложения настраиваются вручную"
+          color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
       }
 
       // ── трафик: две круговые диаграммы (доля приёма/передачи)
