@@ -47,6 +47,8 @@ Panel {
   property string cfgAddr: ""
   property string cfgGw: ""
   property bool confirmApply: false
+  property bool confirmStopDaemon: false
+  property real now: Date.now() / 1000
 
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
   readonly property bool daemonUp: state.daemon === true
@@ -72,6 +74,20 @@ Panel {
     if (n >= 1024) return (n / 1024).toFixed(0) + "К"
     return Math.round(n) + ""
   }
+  function fmtMB(n) {
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " ГБ"
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " МБ"
+    if (n >= 1024) return (n / 1024).toFixed(0) + " КБ"
+    return Math.round(n) + " Б"
+  }
+  function fmtUptime(sinceSec) {
+    var s = Math.max(0, Math.floor(root.now - sinceSec))
+    var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600)
+    var m = Math.floor(s % 3600 / 60)
+    if (d > 0) return d + "д " + h + "ч"
+    if (h > 0) return h + "ч " + m + "м"
+    return m + "м " + (s % 60) + "с"
+  }
   function fmtBpsFull(n) {
     return fmtBps(n) + " Б/с"
   }
@@ -85,6 +101,7 @@ Panel {
   function resetConfirms() {
     root.confirmAdd = false
     root.confirmDaemon = false
+    root.confirmStopDaemon = false
   }
 
   function addUri() {
@@ -171,6 +188,14 @@ Panel {
   }
 
   function refresh() { if (!procState.running) procState.running = true }
+
+  // красная ошибка не должна висеть вечно
+  onLastErrorChanged: if (lastError !== "") errTimer.restart()
+  Timer {
+    id: errTimer
+    interval: 6000
+    onTriggered: root.lastError = ""
+  }
 
   function act(args) {
     if (busy) return
@@ -326,6 +351,80 @@ Panel {
         }
       }
 
+      // ── информер подключённого сервера
+      BorderSurface {
+        visible: root.connected && root.active.name !== undefined
+        width: parent.width
+        height: visible ? infPad.implicitHeight + Style.space(12) : 0
+        radius: Style.space(6)
+        color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g,
+                       Commons.Color.accent.b, 0.07)
+        borderSpec: Border.controlSpec("normal",
+          Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g,
+                  Commons.Color.accent.b, 0.45),
+          Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g,
+                  Commons.Color.accent.b, 0.45))
+
+        Row {
+          id: infPad
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: Style.space(10)
+          anchors.rightMargin: Style.space(10)
+          spacing: Style.space(8)
+
+          Rectangle {
+            id: infDot
+            width: Style.space(7)
+            height: width
+            radius: height / 2
+            anchors.verticalCenter: parent.verticalCenter
+            color: Commons.Color.accent
+            SequentialAnimation on opacity {
+              running: root.connected
+              loops: Animation.Infinite
+              NumberAnimation { from: 1; to: 0.35; duration: 900 }
+              NumberAnimation { from: 0.35; to: 1; duration: 900 }
+            }
+          }
+
+          Column {
+            id: infCol
+            width: infPad.width - infDot.width - infPad.spacing
+            spacing: 1
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              text: "🟢 " + (root.active.name || "")
+              color: root.fg
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              text: (root.active.address || "") + ":" + (root.active.port || "")
+                + " · " + (root.active.proto || "")
+                + (root.active.since ? " · на связи " + root.fmtUptime(root.active.since) : "")
+                + " · ↓" + root.fmtMB(root.rxTotal) + " ↑" + root.fmtMB(root.txTotal)
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.6)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+      }
+
+      Timer {
+        interval: 1000
+        running: root.connected
+        repeat: true
+        onTriggered: root.now = Date.now() / 1000
+      }
+
       // ── органы управления (над списком)
       Button {
         visible: !root.daemonUp
@@ -392,9 +491,39 @@ Panel {
           onClicked: root.pingAll()
         }
 
+        Button {
+          id: stopDaemonBtn
+          anchors.left: pingActiveBtn.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          visible: root.daemonUp
+          text: root.confirmStopDaemon ? "стоп демон — подтвердить?" : "⏻ стоп"
+          fontSize: Style.font.bodySmall
+          foreground: root.confirmStopDaemon ? Qt.rgba(0.95, 0.4, 0.35, 1) : root.fg
+          accent: Commons.Color.accent
+          bordered: true
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(2)
+          enabled: !root.busy
+          onClicked: {
+            if (!root.confirmStopDaemon) {
+              root.confirmStopDaemon = true
+              stopConfirmTimer.restart()
+            } else {
+              root.confirmStopDaemon = false
+              root.act(["daemon", "stop"])
+            }
+          }
+          Timer {
+            id: stopConfirmTimer
+            interval: 5000
+            onTriggered: root.confirmStopDaemon = false
+          }
+        }
+
         Text {
           anchors.right: parent.right
-          anchors.left: pingActiveBtn.right
+          anchors.left: stopDaemonBtn.visible ? stopDaemonBtn.right : pingActiveBtn.right
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           horizontalAlignment: Text.AlignRight

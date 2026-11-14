@@ -35,8 +35,14 @@ pub fn build(server: &Server, st: &Settings, with_tun: bool) -> Value {
                 "network": "tun",
                 "name": "omaxy0",
                 "address": [server_tun_address(st)],
-                "gateway": st.tun_gateway,
+                // xray >=25: gateway — массив CIDR, префикс берём из tun_address
+                "gateway": [format!(
+                    "{}/{}",
+                    st.tun_gateway,
+                    st.tun_address.split('/').nth(1).unwrap_or("30")
+                )],
                 "mtu": 9000,
+                // маршруты навешивает демон (policy table 88), xray не трогает систему
                 "strictRoute": false
             }
         }));
@@ -168,10 +174,13 @@ fn build_outbound(server: &Server) -> Value {
                 "vnext": [{
                     "address": server.address,
                     "port": server.port,
-                    "id": server.uuid,
-                    "encryption": server.encryption.clone().unwrap_or_else(|| "none".into()),
-                    "flow": server.flow.clone().unwrap_or_default(),
-                    "level": 8
+                    // xray >=25: vnext.users[{id, encryption, flow}] — ровно один пользователь
+                    "users": [{
+                        "id": server.uuid,
+                        "encryption": server.encryption.clone().unwrap_or_else(|| "none".into()),
+                        "flow": server.flow.clone().unwrap_or_default(),
+                        "level": 8
+                    }]
                 }]
             },
             "streamSettings": stream_settings(server)

@@ -23,9 +23,17 @@ BarWidget {
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
 
   function fmtBps(n) {
-    if (n >= 1048576) return (n / 1048576).toFixed(1) + "М"
-    if (n >= 1024) return (n / 1024).toFixed(0) + "К"
-    return Math.round(n) + ""
+    var v
+    if (n >= 1048576) v = (n / 1048576).toFixed(1)
+    else if (n >= 1024) v = String(Math.round(n / 1024))
+    else v = String(Math.round(n))
+    while (v.length < 3) v = "0" + v // лидирующие нули — фиксированная ширина
+    return v
+  }
+  function unitBps(n) {
+    if (n >= 1048576) return "М"
+    if (n >= 1024) return "К"
+    return "Б"
   }
 
   function sampleTraffic(s) {
@@ -70,7 +78,8 @@ BarWidget {
       return "omaxy: демон не запущен"
     if (connected)
       return "Прокси: " + activeName + " (" + activeProto + ")\n"
-        + "R " + root.fmtBps(root.rxRate) + " Б/с · S " + root.fmtBps(root.txRate) + " Б/с\n"
+        + "R " + root.fmtBps(root.rxRate) + root.unitBps(root.rxRate) + "/с · S "
+            + root.fmtBps(root.txRate) + root.unitBps(root.txRate) + "/с\n"
         + "клик — панель"
     return "Прокси выключен — клик выбирает сервер"
   }
@@ -185,18 +194,18 @@ BarWidget {
     Text {
       visible: root.connected
       anchors.verticalCenter: parent.verticalCenter
-      text: "R " + root.fmtBps(root.rxRate)
+      text: "R " + root.fmtBps(root.rxRate) + root.unitBps(root.rxRate)
       color: Color.accent
-      font.family: Style.font.family
+      font.family: "monospace"
       font.pixelSize: Style.font.caption
     }
 
     Text {
       visible: root.connected
       anchors.verticalCenter: parent.verticalCenter
-      text: "S " + root.fmtBps(root.txRate)
+      text: "S " + root.fmtBps(root.txRate) + root.unitBps(root.txRate)
       color: Qt.rgba(0.95, 0.68, 0.30, 0.95)
-      font.family: Style.font.family
+      font.family: "monospace"
       font.pixelSize: Style.font.caption
     }
   }

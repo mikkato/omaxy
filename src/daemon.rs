@@ -64,6 +64,16 @@ impl Daemon {
     pub fn run(&self) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
         std::fs::create_dir_all(LIB_DIR).ok();
+        // при старте убираем osиротевший xray от прошлых жизней (иначе "device busy")
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f", "xray run -c /var/lib/omaxy/"])
+            .status();
+        for _ in 0..15 {
+            if !std::path::Path::new("/sys/class/net/omaxy0").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         let listener = UnixListener::bind(&self.socket_path)?;
         std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o666))?;
         eprintln!("omaxyd listening on {}", self.socket_path);
@@ -337,7 +347,22 @@ fn handle_action(
                         "processes": list, "daemon-version": DAEMON_VERSION}))
         }
         "clear-logs" => Some(ok(action, "logs cleared")),
-        "shutdown" => Some(ok(action, "shutting down")),
+        "shutdown" => {
+            {
+                let mut p = procs.lock().unwrap();
+                for e in p.values() {
+                    if let Some(pid) = e.pid {
+                        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    }
+                    tun_teardown(&e.spec);
+                }
+            }
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(400));
+                std::process::exit(0);
+            });
+            Some(ok(action, "shutting down"))
+        }
         _ => Some(err(action, &format!("Unknown action: {action}"))),
     }
 }
@@ -412,12 +437,43 @@ fn cmd_start(msg: &Value, owner: u64, procs: &Arc<Mutex<HashMap<String, ProcEntr
 
 fn spawn(spec: ProcSpec) -> Result<(Child, ProcEntry), std::io::Error> {
     apply_tun_sysctls(&spec);
+    if tun_env(&spec).is_some() {
+        // маршрутизация ставится после появления интерфейса (поток ждёт его сам)
+        let s = spec.clone();
+        std::thread::spawn(move || tun_setup(s));
+    }
     let mut cmd = Command::new(&spec.executable);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    // логи управляемого процесса — в /var/log/omaxy-<id>.log (diagnostics)
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("/var/log/omaxy-{}.log", spec.id))
+        .ok();
+    cmd.stdin(Stdio::piped());
+    // управляемые процессы умирают вместе с демоном (xray не должен осиротеть)
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    match (&log, &log) {
+        (Some(f), Some(g)) => {
+            cmd.stdout(Stdio::from(g.try_clone()?)).stderr(Stdio::from(f.try_clone()?));
+        }
+        _ => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let stdin_tx = child.stdin.take().map(|mut si| {
@@ -474,6 +530,16 @@ fn watchdog(mut child: Child, spec: ProcSpec, procs: Arc<Mutex<HashMap<String, P
             "exit-code": code
         }));
         if !do_restart {
+            // не снимать маршруты, если этот pid уже заменён новым экземпляром
+            let owned_now = procs
+                .lock()
+                .unwrap()
+                .get(&spec.id)
+                .and_then(|e| e.pid)
+                .is_some();
+            if !owned_now {
+                tun_teardown(&spec);
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(spec.restart_delay_ms));
@@ -543,3 +609,127 @@ fn apply_tun_sysctls(spec: &ProcSpec) {
     }
     let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
 }
+
+// ---------- TUN policy routing (xray >=25 не ставит маршруты сам) ----------
+
+fn tun_get(spec: &ProcSpec, key: &str) -> Option<String> {
+    spec.env
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+}
+
+/// Запускать только если spec — туннельный процесс.
+fn tun_env(spec: &ProcSpec) -> Option<()> {
+    matches!(tun_get(spec, "OMAXY_TUN").as_deref(), Some("1")).then_some(())
+}
+
+fn ip_cmd(args: &[&str]) {
+    let _ = Command::new("ip")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Ждёт интерфейс, потом поднимает policy-таблицу 88 и DNS через resolved.
+fn tun_setup(spec: ProcSpec) {
+    let iface = tun_get(&spec, "OMAXY_TUN_IF").unwrap_or_else(|| "omaxy0".into());
+    let server = tun_get(&spec, "OMAXY_TUN_SERVER").unwrap_or_default();
+    let dns = tun_get(&spec, "OMAXY_TUN_DNS").unwrap_or_default();
+
+    let dev = format!("/sys/class/net/{iface}");
+    for _ in 0..100 {
+        if std::path::Path::new(&dev).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !std::path::Path::new(&dev).exists() {
+        eprintln!("tun_setup: interface {iface} did not appear");
+        return;
+    }
+    // обход приватных/линк-локальных сетей — в main
+    let lan = [
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+    ];
+    for (i, c) in lan.iter().enumerate() {
+        let prio = format!("{}", 30400 + i);
+        ip_cmd(&["rule", "del", "priority", &prio]);
+        ip_cmd(&["rule", "add", "priority", &prio, "to", c, "lookup", "main"]);
+    }
+    // обход адреса сервера (иначе петля)
+    if !server.is_empty() {
+        let host = server.split(':').next().unwrap_or("");
+        if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+            for (i, a) in addrs.filter(|a| a.is_ipv4()).enumerate().take(8) {
+                let prio = format!("{}", 30500 + i);
+                ip_cmd(&["rule", "del", "priority", &prio]);
+                ip_cmd(&[
+                    "rule", "add", "priority", &prio,
+                    "to", &format!("{a}/32"), "lookup", "main",
+                ]);
+            }
+        }
+    }
+    // обход DNS-серверов: без этого xray не может разрешить имя своего сервера
+    // (DNS уходит в туннель, который поднимается этим xray — бутстрап-петля)
+    if !dns.is_empty() {
+        for (i, d) in dns.split(',').map(|s| s.trim()).enumerate().take(8) {
+            if d.parse::<std::net::Ipv4Addr>().is_ok() {
+                let prio = format!("{}", 30450 + i);
+                ip_cmd(&["rule", "del", "priority", &prio]);
+                ip_cmd(&["rule", "add", "priority", &prio, "to", &format!("{d}/32"),
+                         "lookup", "main"]);
+            }
+        }
+    }
+    ip_cmd(&["route", "replace", "default", "dev", &iface, "table", "88"]);
+    ip_cmd(&["rule", "del", "priority", "31000"]);
+    ip_cmd(&["rule", "add", "priority", "31000", "from", "all", "lookup", "88"]);
+    if !dns.is_empty() {
+        let mut a: Vec<String> = vec!["dns".into(), iface.clone()];
+        a.extend(dns.split(',').map(|s| s.trim().to_string()));
+        let _ = Command::new("resolvectl").args(&a).status();
+        let _ = Command::new("resolvectl")
+            .args(["domain", &iface, "~."])
+            .status();
+        let _ = Command::new("resolvectl")
+            .args(["default-route", &iface, "yes"])
+            .status();
+    }
+    eprintln!("tun: routing up on {iface}");
+}
+
+fn tun_teardown(spec: &ProcSpec) {
+    if tun_env(spec).is_none() {
+        return;
+    }
+    let iface = tun_get(spec, "OMAXY_TUN_IF").unwrap_or_else(|| "omaxy0".into());
+    let server = tun_get(spec, "OMAXY_TUN_SERVER").unwrap_or_default();
+    for i in 0..8 {
+        ip_cmd(&["rule", "del", "priority", &format!("{}", 30400 + i)]);
+    }
+    if !server.is_empty() {
+        let host = server.split(':').next().unwrap_or("");
+        if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+            for (i, a) in addrs.filter(|a| a.is_ipv4()).enumerate().take(8) {
+                let _ = a;
+                ip_cmd(&["rule", "del", "priority", &format!("{}", 30500 + i)]);
+            }
+        }
+    }
+    ip_cmd(&["rule", "del", "priority", "31000"]);
+    ip_cmd(&["route", "flush", "table", "88"]);
+    let _ = Command::new("resolvectl").args(["revert", &iface]).status();
+    eprintln!("tun: routing down on {iface}");
+}
+
+use std::net::ToSocketAddrs;

@@ -107,6 +107,19 @@ fn main() {
         "daemon" => {
             if args.get(1).map(|s| s.as_str()) == Some("ensure") {
                 cli_daemon_ensure()
+            } else if args.get(1).map(|s| s.as_str()) == Some("stop") {
+                (|| -> Result<(), String> {
+                    let mut c = Conn::open().map_err(|e| format!("демон не отвечает: {e}"))?;
+                    let r = c
+                        .call(json!({"action": "shutdown", "request-id": 9}))
+                        .map_err(|e| e.to_string())?;
+                    if r.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        println!("демон остановлен");
+                        Ok(())
+                    } else {
+                        Err(format!("shutdown: {r}"))
+                    }
+                })()
             } else {
                 let daemonize = args.iter().any(|a| a == "--daemonize");
                 if daemonize {
@@ -279,6 +292,12 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
     if server.kind == links::ServerKind::Hysteria2 {
         return Err("hysteria2 в генераторе xray-конфига пока не поддерживается".into());
     }
+    if !std::path::Path::new(&cfg.settings.xray_path).exists() {
+        return Err(format!(
+            "xray не найден: {} — установи (pacman -S xray) или укажи путь: omaxy config set xray_path <path>",
+            cfg.settings.xray_path
+        ));
+    }
     let conf = xrayconf::build(&server, &cfg.settings, cfg.settings.tun);
     let conf_str = serde_json::to_string_pretty(&conf).unwrap();
     let mut c = Conn::open()?;
@@ -293,7 +312,7 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
         "process-id": "omaxy-xray",
         "executable": cfg.settings.xray_path,
         "arguments": ["run", "-c", "/var/lib/omaxy/xray-active.json"],
-        "environment": {"OMAXY_TUN": "1"},
+        "environment": tun_env_map(&server, &cfg.settings),
         "auto-restart": true,
         "max-restart-attempts": 5,
         "restart-delay-ms": 3000,
@@ -308,6 +327,7 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
     store::save(&cfg2)?;
     write_active(&json!({
         "server_id": server.id, "name": server.name, "proto": proto(&server),
+        "address": server.address, "port": server.port,
         "since": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
     }))?;
     println!("connected: {} ({}:{})", server.name, server.address, server.port);
@@ -404,6 +424,18 @@ fn cli_status(args: &[String]) -> Result<(), String> {
 
 /// TCP connect latency to the server endpoint (ICMP rarely works on proxy ports):
 /// 3 attempts, min/median in ms. With --all: one probe per server, parallel.
+fn tun_env_map(server: &links::Server, st: &store::Settings) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("OMAXY_TUN".into(), serde_json::json!("1"));
+    m.insert("OMAXY_TUN_IF".into(), serde_json::json!("omaxy0"));
+    m.insert(
+        "OMAXY_TUN_SERVER".into(),
+        serde_json::json!(format!("{}:{}", server.address, server.port)),
+    );
+    m.insert("OMAXY_TUN_DNS".into(), serde_json::json!(st.dns.join(",")));
+    m
+}
+
 fn cli_ping(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--all") {
         return cli_ping_all();
