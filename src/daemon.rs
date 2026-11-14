@@ -814,6 +814,9 @@ fn tun_teardown(spec: &ProcSpec) {
     for i in 0..8 {
         ip_cmd(&["rule", "del", "priority", &format!("{}", 30400 + i)]);
     }
+    for i in 0..8 {
+        ip_cmd(&["rule", "del", "priority", &format!("{}", 30450 + i)]);
+    }
     if !server.is_empty() {
         let host = server.split(':').next().unwrap_or("");
         if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
