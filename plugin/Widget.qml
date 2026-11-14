@@ -107,6 +107,14 @@ BarWidget {
     target: "mikkato.omaxy"
 
     function refresh(): void { root.refresh() }
+    function pingAll(): void {
+      if (panelLoader.item && panelLoader.item.pingAll) panelLoader.item.pingAll()
+    }
+    function pingState(): string {
+      var it = panelLoader.item
+      if (!it || !it.pings) return "{}"
+      return JSON.stringify(it.pings)
+    }
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
