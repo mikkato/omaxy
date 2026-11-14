@@ -964,7 +964,17 @@ fn bypass_restore_cg(uid: u32) -> String {
 
 fn bypass_put_back(p: u32, src: &str) -> bool {
     let srcpath = format!("/sys/fs/cgroup{src}");
+    // никогда не пишем в замороженный cgroup: write() в ядре встанет навечно
+    let frozen = |dir: &str| -> bool {
+        let mut d = std::path::PathBuf::from(dir);
+        loop {
+            if std::fs::read_to_string(d.join("cgroup.freeze"))
+                .map(|v| v.trim() == "1").unwrap_or(false) { return true; }
+            if !d.pop() || d == std::path::Path::new("/sys/fs/cgroup") { return false; }
+        }
+    };
     if std::path::Path::new(&format!("{srcpath}/cgroup.procs")).exists()
+        && !frozen(&srcpath)
         && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok()
     {
         return true;
