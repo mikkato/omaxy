@@ -1,0 +1,14 @@
+[Unit]
+Description=omaxy proxy daemon (root, wire-compatible with happd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/mikkato/.local/bin/omaxy daemon
+Restart=on-failure
+RestartSec=2
+# демон слушает /tmp/happd.sock, поднимает TUN и правит routing — нужен root
+
+[Install]
+WantedBy=multi-user.target
