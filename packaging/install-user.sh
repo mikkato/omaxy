@@ -8,6 +8,13 @@ BIN_SRC=target/release/omaxy
 mkdir -p ~/.local/bin
 install -m755 "$BIN_SRC" ~/.local/bin/omaxy
 
+GUI_SRC=target/release/omaxy-gui
+if [ -x "$GUI_SRC" ]; then
+  install -m755 "$GUI_SRC" ~/.local/bin/omaxy-gui
+  mkdir -p ~/.local/share/applications
+  install -m644 packaging/omaxy-gui.desktop ~/.local/share/applications/ 2>/dev/null || true
+fi
+
 # QML-модуль панели (копия плагина в конфиг, переименован по id)
 DEST=~/.config/omarchy/plugins/mikkato.omaxy
 mkdir -p "$DEST"

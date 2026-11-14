@@ -1,0 +1,294 @@
+import { Button, LineEdit, ListView, GroupBox, Palette } from "std-widgets.slint";
+
+export { Palette } from "std-widgets.slint";
+
+export struct ServerRow {
+    id: string,
+    name: string,
+    proto: string,
+    address: string,
+    port: int,
+    active: bool,
+}
+
+export struct SubRow {
+    id: string,
+    name: string,
+    count: int,
+}
+
+export component OmaxyWindow inherits Window {
+    title: "omaxy";
+    preferred-width: 420px;
+    preferred-height: 600px;
+    background: #14161c;
+    default-font-size: 13px;
+
+    in-out property <string> status-text: "загрузка…";
+    in-out property <bool> daemon-running: false;
+    in-out property <bool> connected: false;
+    in-out property <bool> busy: false;
+    in-out property <string> message: "";
+    in-out property <bool> message-error: false;
+    in-out property <string> qr-path <=> qr-edit.text;
+    in-out property <string> link-input <=> link-edit.text;
+    in-out property <[ServerRow]> servers;
+    in-out property <[SubRow]> subscriptions;
+    in-out property <int> selected-index: -1;
+
+    callback connect-request(string);
+    callback disconnect-request();
+    callback refresh-request();
+    callback add-link-request(string);
+    callback qr-import-request(string);
+    callback subscribe-update-request();
+    callback remove-server-request(string);
+
+    // ссылка на Palette, чтобы глобал попал в дерево (color-scheme ставим из Rust)
+    property <ColorScheme> _palette-scheme: Palette.color-scheme;
+
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        VerticalLayout {
+            spacing: 10px;
+
+            // ===== статус-бар =====
+            Rectangle {
+                height: 52px;
+                border-radius: 10px;
+                background: #1d2029;
+                border-width: 1px;
+                border-color: #2a2e3a;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 10px;
+                    spacing: 10px;
+                    Rectangle {
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        cross-axis-self-alignment: CrossAxisAlignment.center;
+                        background: root.connected ? #4ade80
+                                  : (root.daemon-running ? #8a93a8 : #e05c5c);
+                    }
+                    Text {
+                        text: root.status-text;
+                        vertical-alignment: TextVerticalAlignment.center;
+                        horizontal-stretch: 1;
+                        color: #e6e9f0;
+                        overflow: elide;
+                    }
+                    Button {
+                        width: 40px;
+                        text: "⟳";
+                        enabled: !root.busy;
+                        clicked => { root.refresh-request(); }
+                    }
+                    Button {
+                        width: 40px;
+                        text: "⏻";
+                        clicked => { root.refresh-request(); }
+                    }
+                }
+            }
+
+            // ===== серверы =====
+            GroupBox {
+                title: "Серверы";
+                vertical-stretch: 1;
+                Rectangle {
+                    min-height: 140px;
+                    border-radius: 8px;
+                    background: #181b23;
+                    border-width: 1px;
+                    border-color: #2a2e3a;
+                    clip: true;
+                    ListView {
+                        for s[idx] in root.servers: Rectangle {
+                            height: 48px;
+                            border-radius: 6px;
+                            background: root.selected-index == idx ? #262c3d
+                                      : (ta.has-hover ? #1f2330 : transparent);
+                            ta := TouchArea {
+                                clicked => { root.selected-index = idx; }
+                            }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 6px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: LayoutAlignment.center;
+                                    Text {
+                                        text: s.name;
+                                        color: #e6e9f0;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: s.address + ":" + s.port;
+                                        font-size: 10px;
+                                        color: #7d879c;
+                                        overflow: elide;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 52px;
+                                    height: 20px;
+                                    border-radius: 6px;
+                                    cross-axis-self-alignment: CrossAxisAlignment.center;
+                                    background: #2c3350;
+                                    Text {
+                                        text: s.proto;
+                                        font-size: 10px;
+                                        color: #aab6ff;
+                                        horizontal-alignment: TextHorizontalAlignment.center;
+                                        vertical-alignment: TextVerticalAlignment.center;
+                                    }
+                                }
+                                Text {
+                                    width: 18px;
+                                    horizontal-alignment: TextHorizontalAlignment.center;
+                                    vertical-alignment: TextVerticalAlignment.center;
+                                    text: s.active ? "✓" : "";
+                                    color: #4ade80;
+                                }
+                                Button {
+                                    width: 30px;
+                                    height: 28px;
+                                    cross-axis-self-alignment: CrossAxisAlignment.center;
+                                    text: "✕";
+                                    enabled: !root.busy;
+                                    clicked => { root.remove-server-request(s.id); }
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        visible: root.servers.length == 0;
+                        width: parent.width;
+                        height: parent.height;
+                        text: "нет серверов — добавь ссылку ниже";
+                        color: #7d879c;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        vertical-alignment: TextVerticalAlignment.center;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    text: "Включить";
+                    enabled: !root.busy && root.servers.length > 0;
+                    horizontal-stretch: 1;
+                    clicked => {
+                        root.connect-request(root.selected-index >= 0 && root.selected-index < root.servers.length
+                            ? root.servers[root.selected-index].id : "");
+                    }
+                }
+                Button {
+                    text: "Выключить";
+                    enabled: !root.busy && root.connected;
+                    horizontal-stretch: 1;
+                    clicked => { root.disconnect-request(); }
+                }
+            }
+
+            // ===== добавить ссылку =====
+            GroupBox {
+                title: "Добавить ссылку";
+                VerticalLayout {
+                    spacing: 6px;
+                    link-edit := LineEdit {
+                        placeholder-text: "vless://…";
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: "Добавить";
+                            enabled: !root.busy && root.link-input != "";
+                            clicked => { root.add-link-request(root.link-input); }
+                        }
+                    }
+                    qr-edit := LineEdit {
+                        placeholder-text: "Путь к PNG со QR-кодом…";
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: "QR из файла…";
+                            enabled: !root.busy && root.qr-path != "";
+                            clicked => { root.qr-import-request(root.qr-path); }
+                        }
+                    }
+                }
+            }
+
+            // ===== подписки =====
+            GroupBox {
+                title: "Подписки";
+                VerticalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        min-height: 60px;
+                        max-height: 120px;
+                        border-radius: 8px;
+                        background: #181b23;
+                        border-width: 1px;
+                        border-color: #2a2e3a;
+                        clip: true;
+                        ListView {
+                            for sb in root.subscriptions: Rectangle {
+                                height: 34px;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: sb.name;
+                                        color: #e6e9f0;
+                                        vertical-alignment: TextVerticalAlignment.center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: sb.count <= 0 ? "пусто" : sb.count + " серв.";
+                                        font-size: 11px;
+                                        color: #7d879c;
+                                        vertical-alignment: TextVerticalAlignment.center;
+                                    }
+                                }
+                            }
+                        }
+                        Text {
+                            visible: root.subscriptions.length == 0;
+                            width: parent.width;
+                            height: parent.height;
+                            text: "нет подписок";
+                            color: #7d879c;
+                            horizontal-alignment: TextHorizontalAlignment.center;
+                            vertical-alignment: TextVerticalAlignment.center;
+                        }
+                    }
+                    Button {
+                        text: "Обновить все";
+                        enabled: !root.busy && root.subscriptions.length > 0;
+                        horizontal-stretch: 1;
+                        clicked => { root.subscribe-update-request(); }
+                    }
+                }
+            }
+
+            // ===== сообщения =====
+            Text {
+                text: root.message;
+                wrap: TextWrap.word-wrap;
+                color: root.message-error ? #f08a8a : #8fa3c7;
+                max-height: 48px;
+                overflow: elide;
+            }
+        }
+    }
+}

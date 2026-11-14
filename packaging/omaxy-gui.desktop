@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=omaxy
+Name[ru]=omaxy — Xray клиент
+Comment=Open Xray proxy client (TUN daemon)
+Comment[ru]=Открытый Xray-клиент (TUN-демон)
+Exec=omaxy-gui
+Icon=network-vpn
+Terminal=false
+Categories=Network;Qt;
+NoDisplay=false
+StartupNotify=true
+Keywords=proxy;vpn;xray;vless;
