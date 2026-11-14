@@ -36,8 +36,8 @@ impl Default for Settings {
             dns: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             route_mode: "direct-local".into(),
             xray_path: "/usr/bin/xray".into(),
-            tun_address: "10.259.260.1/30".into(),
-            tun_gateway: "10.259.260.2".into(),
+            tun_address: "10.77.0.1/30".into(),
+            tun_gateway: "10.77.0.2".into(),
         }
     }
 }
@@ -73,6 +73,11 @@ pub fn load() -> Config {
             if cfg.settings.dns.is_empty() {
                 cfg.settings = Settings::default();
             }
+            // heal the historically-broken default 10.259.260.1/30 (octet 260)
+            if !valid_v4_cidr_prefix(&cfg.settings.tun_address) {
+                cfg.settings.tun_address = Settings::default().tun_address;
+                cfg.settings.tun_gateway = Settings::default().tun_gateway;
+            }
             cfg
         }
         Err(_) => Config {
@@ -80,6 +85,13 @@ pub fn load() -> Config {
             ..Default::default()
         },
     }
+}
+
+fn valid_v4_cidr_prefix(s: &str) -> bool {
+    let ip = s.split('/').next().unwrap_or("");
+    !ip.is_empty()
+        && ip.split('.').count() == 4
+        && ip.split('.').all(|o| o.parse::<u8>().is_ok())
 }
 
 pub fn save(cfg: &Config) -> Result<(), String> {

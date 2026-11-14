@@ -5,7 +5,8 @@ import qs.Commons
 import qs.Ui
 
 // Индикатор omaxy-прокси в правой секции бара; клик — панель серверов.
-// Состояние — `omaxy status --json` раз в 5 секунд.
+// Состояние — `omaxy status --json` раз в 2 секунды. Рядом с иконкой —
+// скорость: R (принято, Б/с) и S (отправлено, Б/с).
 BarWidget {
   id: root
   moduleName: "mikkato.omaxy"
@@ -15,8 +16,38 @@ BarWidget {
   property string activeName: ""
   property string activeProto: ""
   property var servers: []
+  property real rxRate: 0
+  property real txRate: 0
+  property var prevSample: null
 
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
+
+  function fmtBps(n) {
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + "М"
+    if (n >= 1024) return (n / 1024).toFixed(0) + "К"
+    return Math.round(n) + ""
+  }
+
+  function sampleTraffic(s) {
+    var now = Date.now() / 1000
+    var t = s.traffic
+    if (!root.connected || !t || t.rx === undefined) {
+      prevSample = null
+      rxRate = 0
+      txRate = 0
+      return
+    }
+    if (prevSample) {
+      var dt = now - prevSample.t
+      if (dt > 0.25) {
+        rxRate = Math.max(0, (t.rx - prevSample.rx) / dt)
+        txRate = Math.max(0, (t.tx - prevSample.tx) / dt)
+        prevSample = { t: now, rx: t.rx, tx: t.tx }
+      }
+    } else {
+      prevSample = { t: now, rx: t.rx, tx: t.tx }
+    }
+  }
 
   function applyJson(txt) {
     var s = {}
@@ -31,13 +62,16 @@ BarWidget {
     var a = s.active || {}
     activeName = connected ? (a.name || "") : ""
     activeProto = connected ? (a.proto || "") : ""
+    sampleTraffic(s)
   }
 
   readonly property string tip: {
     if (!daemonUp)
       return "omaxy: демон не запущен"
     if (connected)
-      return "Прокси: " + activeName + " (" + activeProto + ") — клик для панели"
+      return "Прокси: " + activeName + " (" + activeProto + ")\n"
+        + "R " + root.fmtBps(root.rxRate) + " Б/с · S " + root.fmtBps(root.txRate) + " Б/с\n"
+        + "клик — панель"
     return "Прокси выключен — клик выбирает сервер"
   }
 
@@ -63,7 +97,7 @@ BarWidget {
   }
 
   visible: true
-  implicitWidth: button.implicitWidth
+  implicitWidth: row.implicitWidth
   implicitHeight: button.implicitHeight
 
   onBarChanged: injectPanel()
@@ -101,7 +135,7 @@ BarWidget {
   }
 
   Timer {
-    interval: 5000
+    interval: 2000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -119,19 +153,43 @@ BarWidget {
     }
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    text: "\uf0ac"
-    slotSize: Style.bar.statusSlot
-    fontSize: Style.font.caption
-    useActiveColor: true
-    active: root.connected
-    tooltipText: root.tip
-    onPressed: function(b) {
-      if (b === Qt.RightButton) root.toggleProxy()
-      else root.togglePanel()
+  Row {
+    id: row
+    anchors.verticalCenter: parent.verticalCenter
+    spacing: Style.space(4)
+
+    BarIconButton {
+      id: button
+      bar: root.bar
+      text: "\uf0ac"
+      slotSize: Style.bar.statusSlot
+      fontSize: Style.font.caption
+      useActiveColor: true
+      active: root.connected
+      tooltipText: root.tip
+      onPressed: function(b) {
+        if (b === Qt.RightButton) root.toggleProxy()
+        else root.togglePanel()
+      }
+    }
+
+    // скорости R/S — только когда подключено
+    Text {
+      visible: root.connected
+      anchors.verticalCenter: parent.verticalCenter
+      text: "R " + root.fmtBps(root.rxRate)
+      color: Color.accent
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      visible: root.connected
+      anchors.verticalCenter: parent.verticalCenter
+      text: "S " + root.fmtBps(root.txRate)
+      color: Qt.rgba(0.95, 0.68, 0.30, 0.95)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
     }
   }
 }

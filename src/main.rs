@@ -83,6 +83,23 @@ fn read_active() -> Option<Value> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// Cumulative TUN byte counters from sysfs (iface set in xrayconf: omaxy0).
+fn read_traffic() -> Option<Value> {
+    for iface in ["omaxy0", "tun0"] {
+        let rd = |f: &str| {
+            std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        if let (Some(rx), Some(tx)) = (rd("rx_bytes"), rd("tx_bytes")) {
+            return Some(json!({"iface": iface, "rx": rx, "tx": tx}));
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -108,6 +125,7 @@ fn main() {
         "disconnect" => cli_disconnect(),
         "status" => cli_status(&args[1..]),
         "qr" => cli_qr(&args[1..]),
+        "ping" => cli_ping(&args[1..]),
         "call" => cli_call(&args[1..]),
         _ => {
             println!(
@@ -341,6 +359,7 @@ fn cli_status(args: &[String]) -> Result<(), String> {
                 "daemon_version": r.get("daemon-version"),
                 "connected": running,
                 "active": read_active(),
+                "traffic": read_traffic(),
                 "servers": servers,
                 "subscriptions": out["subscriptions"].clone(),
                 "processes": r.get("processes").cloned().unwrap_or(json!([]))
@@ -376,6 +395,56 @@ fn cli_status(args: &[String]) -> Result<(), String> {
         } else {
             println!("○ не подключено");
         }
+    }
+    Ok(())
+}
+
+/// TCP connect latency to the server endpoint (ICMP rarely works on proxy ports):
+/// 3 attempts, min/median in ms.
+fn cli_ping(args: &[String]) -> Result<(), String> {
+    let json_out = args.iter().any(|a| a == "--json");
+    let sel = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let cfg = store::load();
+    let server = match &sel {
+        Some(s) => cfg.find_server(s).cloned(),
+        None => cfg.active.as_ref().and_then(|a| cfg.find_server(a).cloned()),
+    }
+    .ok_or("сервер не найден; список: omaxy server list")?;
+    let target = format!("{}:{}", server.address, server.port);
+    let addrs: Vec<std::net::SocketAddr> = {
+        use std::net::ToSocketAddrs;
+        target.to_socket_addrs().map_err(|e| format!("{target}: {e}"))?.collect()
+    };
+    let addrs = addrs.first().ok_or(format!("dns: {target}"))?.to_owned();
+    let mut times: Vec<u128> = Vec::new();
+    let mut last_err = String::new();
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        match std::net::TcpStream::connect_timeout(
+            &addrs,
+            std::time::Duration::from_millis(3000),
+        ) {
+            Ok(_) => times.push(t0.elapsed().as_millis()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    if times.is_empty() {
+        let msg = format!("{target}: {last_err}");
+        if json_out {
+            println!("{}", json!({"id": server.id, "ok": false, "error": msg}));
+            return Ok(());
+        }
+        return Err(msg);
+    }
+    times.sort_unstable();
+    let out = json!({
+        "id": server.id, "ok": true, "target": target,
+        "min_ms": times[0], "median_ms": times[times.len()/2], "attempts": times
+    });
+    if json_out {
+        println!("{out}");
+    } else {
+        println!("{target}: {} мс (мин из {})", times[0], times.len());
     }
     Ok(())
 }

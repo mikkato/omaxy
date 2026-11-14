@@ -1,12 +1,13 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Панель omaxy: статус, список серверов (клик — подключиться), in/out.
-// Данные — `omaxy status --json`, действия — вызовы omaxy CLI.
+// Панель omaxy: управление сверху, трафик (две круговые диаграммы),
+// прокручиваемый список серверов с пингом. Данные — `omaxy status --json`.
 Panel {
   id: root
   moduleName: "mikkato.omaxy"
@@ -24,19 +25,50 @@ Panel {
   property bool confirmAdd: false
   property bool confirmDaemon: false
 
+  // скорость, Б/с — из дельты кумулятивных счётчиков TUN
+  property real rxRate: 0
+  property real txRate: 0
+  property var prevSample: null
+
+  // пинги: id -> {ms: number|-1, busy: bool}
+  property var pings: ({})
+  property var pingQueue: []
+  property bool pingBusy: false
+  property string pingCurrent: ""
+
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
   readonly property bool daemonUp: state.daemon === true
   readonly property bool connected: state.connected === true
   readonly property var servers: state.servers || []
   readonly property var subs: state.subscriptions || []
   readonly property var active: state.active || ({})
+  readonly property var traffic: state.traffic || ({})
+  readonly property real rxTotal: traffic.rx || 0
+  readonly property real txTotal: traffic.tx || 0
   readonly property color fg: root.bar ? root.bar.foreground : Commons.Color.foreground
+  readonly property color rxColor: Commons.Color.accent
+  readonly property color txColor: Qt.rgba(0.95, 0.68, 0.30, 0.95)
 
   readonly property string statusText: !daemonUp ? "демон выключен"
     : connected ? "подключено" : "выключено"
   readonly property color statusColor: !daemonUp
     ? Qt.rgba(0.95, 0.4, 0.35, 0.9)
     : connected ? Commons.Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+
+  function fmtBps(n) {
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + "М"
+    if (n >= 1024) return (n / 1024).toFixed(0) + "К"
+    return Math.round(n) + ""
+  }
+  function fmtBpsFull(n) {
+    return fmtBps(n) + " Б/с"
+  }
+  function fmtBytes(n) {
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " ГиБ"
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " МиБ"
+    if (n >= 1024) return (n / 1024).toFixed(0) + " КиБ"
+    return Math.round(n) + " Б"
+  }
 
   function resetConfirms() {
     root.confirmAdd = false
@@ -57,6 +89,26 @@ Panel {
     uriInput.text = ""
   }
 
+  function setPing(id, obj) {
+    var p = Object.assign({}, root.pings)
+    p[id] = obj
+    root.pings = p
+  }
+
+  function pingServer(id) {
+    if (root.pingBusy && root.pingCurrent === id) return
+    root.pingQueue = root.pingQueue.concat([id])
+    root.setPing(id, { busy: true, ms: -1 })
+    pumpPing()
+  }
+
+  function pumpPing() {
+    if (root.pingBusy || root.pingQueue.length === 0) return
+    root.pingBusy = true
+    root.pingCurrent = root.pingQueue[0]
+    procPing.running = true
+  }
+
   function refresh() { if (!procState.running) procState.running = true }
 
   function act(args) {
@@ -71,6 +123,28 @@ Panel {
 
   function applyState(text) {
     try { root.state = JSON.parse(String(text || "{}")) } catch (e) { return }
+    sampleTraffic()
+  }
+
+  function sampleTraffic() {
+    var now = Date.now() / 1000
+    var t = root.traffic
+    if (!root.connected || !t || t.rx === undefined) {
+      prevSample = null
+      rxRate = 0
+      txRate = 0
+      return
+    }
+    if (prevSample) {
+      var dt = now - prevSample.t
+      if (dt > 0.25) {
+        rxRate = Math.max(0, (t.rx - prevSample.rx) / dt)
+        txRate = Math.max(0, (t.tx - prevSample.tx) / dt)
+        prevSample = { t: now, rx: t.rx, tx: t.tx }
+      }
+    } else {
+      prevSample = { t: now, rx: t.rx, tx: t.tx }
+    }
   }
 
   onOpenedChanged: {
@@ -105,6 +179,25 @@ Panel {
     }
   }
 
+  Process {
+    id: procPing
+    command: [root.cli, "ping", "--json", root.pingCurrent]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var r = {}
+        try { r = JSON.parse(String(text || "{}")) } catch (e) { }
+        var ms = r.ok === true ? (r.min_ms !== undefined ? r.min_ms : -1) : -1
+        root.setPing(root.pingCurrent, { busy: false, ms: ms })
+      }
+    }
+    onExited: (code) => {
+      root.pingBusy = false
+      root.pingQueue = root.pingQueue.slice(1)
+      if (root.pingQueue.length === 0) root.pingCurrent = ""
+      root.pumpPing()
+    }
+  }
+
   Timer {
     interval: 2500
     repeat: true
@@ -119,13 +212,13 @@ Panel {
     bar: root.bar
     owner: root.barIdentity
     open: root.opened
-    contentWidth: card.fittedContentWidth(Style.space(320))
+    contentWidth: card.fittedContentWidth(Style.space(340))
     contentHeight: card.fittedContentHeight(col.implicitHeight)
 
     Column {
       id: col
       anchors.fill: parent
-      spacing: Style.space(6)
+      spacing: Style.space(8)
 
       // ── заголовок + пилюля статуса
       Item {
@@ -161,108 +254,7 @@ Panel {
         }
       }
 
-      // ── серверы
-      Column {
-        width: parent.width
-        spacing: 0
-
-        Repeater {
-          model: root.servers
-
-          Item {
-            required property var modelData
-            width: col.width
-            height: Style.space(22)
-            readonly property bool cur: modelData.active === true ||
-              (root.active.id !== undefined && root.active.id === modelData.id)
-
-            Rectangle {
-              anchors.fill: parent
-              radius: Style.space(4)
-              color: rowHover.hovered || parent.cur
-                ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10) : "transparent"
-            }
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
-              text: (parent.cur ? "✓ " : "   ") + modelData.name
-              color: root.fg
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              elide: Text.ElideRight
-              width: parent.width - protoText.width - Style.space(16)
-            }
-
-            Text {
-              id: protoText
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
-              text: modelData.proto
-              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            HoverHandler { id: rowHover }
-            TapHandler {
-              onTapped: if (!parent.cur && !root.busy) root.act(["connect", parent.modelData.id])
-            }
-          }
-        }
-
-        Text {
-          visible: root.servers.length === 0
-          width: parent.width
-          text: "нет серверов — добавь ссылку ниже"
-          color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.5)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
-      }
-
-      // ── in/out
-      Item {
-        width: parent.width
-        height: Style.space(26)
-
-        Button {
-          id: mainBtn
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          text: root.connected ? "Выключить" : "Включить"
-          fontSize: Style.font.bodySmall
-          foreground: root.fg
-          accent: Commons.Color.accent
-          bordered: true
-          horizontalPadding: Style.space(10)
-          verticalPadding: Style.space(2)
-          enabled: !root.busy && root.daemonUp && root.servers.length > 0
-          onClicked: root.act([root.connected ? "disconnect" : "connect"])
-        }
-
-        Text {
-          anchors.right: parent.right
-          anchors.left: mainBtn.right
-          anchors.leftMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
-          horizontalAlignment: Text.AlignRight
-          elide: Text.ElideRight
-          text: root.busy ? root.action
-            : root.lastError !== "" ? root.lastError
-            : (!root.daemonUp ? "демон не запущен"
-               : root.connected && root.active.name ? root.active.name : "—")
-          color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.65)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-      }
-
-      // ── запуск демона (если не поднят): два нажатия = подтверждение,
-      //    далее polkit-диалог (или systemctl без пароля, если юнит уже установлен)
+      // ── органы управления (над списком)
       Button {
         visible: !root.daemonUp
         width: parent.width
@@ -290,6 +282,65 @@ Panel {
         id: daemonConfirmTimer
         interval: 5000
         onTriggered: root.confirmDaemon = false
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(26)
+
+        Button {
+          id: mainBtn
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.connected ? "Выключить" : "Включить"
+          fontSize: Style.font.bodySmall
+          foreground: root.fg
+          accent: Commons.Color.accent
+          bordered: true
+          horizontalPadding: Style.space(10)
+          verticalPadding: Style.space(2)
+          enabled: !root.busy && root.daemonUp && root.servers.length > 0
+          onClicked: root.act([root.connected ? "disconnect" : "connect"])
+        }
+
+        Button {
+          id: pingActiveBtn
+          anchors.left: mainBtn.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "⚡ пинг"
+          fontSize: Style.font.bodySmall
+          foreground: root.fg
+          accent: Commons.Color.accent
+          bordered: true
+          horizontalPadding: Style.space(8)
+          verticalPadding: Style.space(2)
+          enabled: !root.pingBusy && root.servers.length > 0
+          // пинг активного сервера; если не выбран — первого видимого
+          onClicked: {
+            var id = root.active.id
+            if (id === undefined && root.servers.length > 0) id = root.servers[0].id
+            if (id !== undefined) root.pingServer(id)
+          }
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.left: pingActiveBtn.right
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          horizontalAlignment: Text.AlignRight
+          elide: Text.ElideRight
+          text: root.busy ? root.action
+            : root.lastError !== "" ? root.lastError
+            : (!root.daemonUp ? "демон не запущен"
+               : root.connected && root.active.name ? root.active.name : "—")
+          color: root.lastError !== ""
+            ? Qt.rgba(0.95, 0.4, 0.35, 0.9)
+            : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.65)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
       }
 
       // ── зона ввода URI с подтверждением
@@ -327,6 +378,276 @@ Panel {
         id: addConfirmTimer
         interval: 5000
         onTriggered: root.confirmAdd = false
+      }
+
+      // ── трафик: две круговые диаграммы (доля приёма/передачи)
+      Row {
+        visible: root.daemonUp
+        width: parent.width
+        spacing: Style.space(16)
+
+        TrafficDial {
+          id: dialRx
+          label: "Приём"
+          color: root.rxColor
+          foreground: root.fg
+          fraction: root.rxTotal + root.txTotal > 0
+            ? root.rxTotal / (root.rxTotal + root.txTotal) : 0
+          line1: root.fmtBpsFull(root.rxRate)
+          line2: "всего " + root.fmtBytes(root.rxTotal)
+        }
+
+        TrafficDial {
+          id: dialTx
+          label: "Передача"
+          color: root.txColor
+          foreground: root.fg
+          fraction: root.rxTotal + root.txTotal > 0
+            ? root.txTotal / (root.rxTotal + root.txTotal) : 0
+          line1: root.fmtBpsFull(root.txRate)
+          line2: "всего " + root.fmtBytes(root.txTotal)
+        }
+
+        // подписки — справом столбцом той же строки
+        Column {
+          width: Math.max(Style.space(90),
+            parent.width - dialRx.implicitWidth - dialTx.implicitWidth - 2 * Style.space(16))
+          visible: root.subs.length > 0
+          spacing: 0
+          Text {
+            text: "Подписки"
+            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          Repeater {
+            model: root.subs
+            Text {
+              width: parent.width
+              text: modelData.name + " · " + modelData.count
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.8)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+          Button {
+            visible: root.subs.length > 0
+            text: "⟳ обновить"
+            fontSize: Style.font.caption
+            foreground: root.fg
+            accent: Commons.Color.accent
+            bordered: true
+            horizontalPadding: Style.space(6)
+            verticalPadding: 0
+            enabled: !root.busy
+            onClicked: root.act(["subscribe", "update"])
+          }
+        }
+      }
+
+      // ── серверы: компактный прокручиваемый список с пингом
+      Text {
+        text: "Серверы (" + root.servers.length + ")"
+        visible: root.servers.length > 0
+        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Flickable {
+        id: serverFlick
+        width: parent.width
+        height: Math.min(listCol.implicitHeight, Style.space(170))
+        visible: root.servers.length > 0
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        contentHeight: listCol.implicitHeight
+        contentWidth: width
+        ScrollIndicator.vertical: ScrollIndicator { }
+
+        Column {
+          id: listCol
+          width: parent.width
+
+          Repeater {
+            model: root.servers
+
+            Item {
+              required property var modelData
+              width: listCol.width
+              height: Style.space(22)
+              readonly property bool cur: modelData.active === true ||
+                (root.active.id !== undefined && root.active.id === modelData.id)
+              readonly property var ping: root.pings[modelData.id]
+
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.space(4)
+                color: rowHover.hovered || parent.cur
+                  ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10) : "transparent"
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                text: (parent.cur ? "✓ " : "   ") + modelData.name
+                color: root.fg
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+                width: parent.width - rightRow.width - Style.space(16)
+              }
+
+              Row {
+                id: rightRow
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+
+                // результат пинга напротив сервера
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: parent.parent.ping !== undefined
+                  text: {
+                    var p = parent.parent.ping
+                    if (p === undefined) return ""
+                    if (p.busy === true) return "…"
+                    if (p.ms < 0) return "×"
+                    return p.ms + " мс"
+                  }
+                  color: {
+                    var p = parent.parent.ping
+                    if (p === undefined || p.busy === true) return Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+                    if (p.ms < 0) return Qt.rgba(0.95, 0.4, 0.35, 0.9)
+                    if (p.ms <= 80) return Qt.rgba(0.45, 0.85, 0.5, 0.95)
+                    if (p.ms <= 200) return Qt.rgba(0.95, 0.75, 0.35, 0.95)
+                    return Qt.rgba(0.95, 0.5, 0.35, 0.95)
+                  }
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  id: protoText
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.proto
+                  color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                // ⚡ пинг именно этого сервера
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "⚡"
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  color: pingHover.hovered
+                    ? Commons.Color.accent
+                    : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.4)
+                  HoverHandler {
+                    id: pingHover
+                    cursorShape: Qt.PointingHandCursor
+                  }
+                  TapHandler {
+                    onTapped: root.pingServer(modelData.id)
+                  }
+                }
+              }
+
+              HoverHandler { id: rowHover }
+              TapHandler {
+                onTapped: if (!parent.cur && !root.busy) root.act(["connect", parent.modelData.id])
+              }
+            }
+          }
+        }
+      }
+
+      Text {
+        visible: root.servers.length === 0
+        width: parent.width
+        text: "нет серверов — добавь ссылку выше"
+        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+  }
+
+  // ── круговая диаграмма трафика (пончик с долей)
+  component TrafficDial: Item {
+    id: dial
+    property string label: ""
+    property color color: Commons.Color.accent
+    property color foreground: Commons.Color.foreground
+    property real fraction: 0
+    property string line1: ""
+    property string line2: ""
+    readonly property real dialSize: Style.space(46)
+    implicitWidth: Math.max(dialSize, rowTxt.implicitWidth)
+    implicitHeight: dialSize + Style.space(2) + rowTxt.implicitHeight
+
+    onFractionChanged: canvas.requestPaint()
+    onColorChanged: canvas.requestPaint()
+
+    Canvas {
+      id: canvas
+      width: dial.dialSize
+      height: dial.dialSize
+      onPaint: {
+        var ctx = getContext("2d")
+        ctx.clearRect(0, 0, width, height)
+        var lw = width * 0.16
+        var r = (width - lw) / 2
+        var cx = width / 2
+        ctx.beginPath()
+        ctx.arc(cx, cx, r, 0, 2 * Math.PI)
+        ctx.lineWidth = lw
+        ctx.strokeStyle = Qt.rgba(dial.foreground.r, dial.foreground.g, dial.foreground.b, 0.14)
+        ctx.stroke()
+        if (dial.fraction > 0.003) {
+          ctx.beginPath()
+          var a0 = -Math.PI / 2
+          ctx.arc(cx, cx, r, a0, a0 + 2 * Math.PI * Math.min(1, dial.fraction))
+          ctx.lineWidth = lw
+          ctx.lineCap = "round"
+          ctx.strokeStyle = Qt.rgba(dial.color.r, dial.color.g, dial.color.b, 0.95)
+          ctx.stroke()
+        }
+      }
+    }
+
+    Text {
+      anchors.centerIn: canvas
+      text: Math.round(dial.fraction * 100) + "%"
+      color: dial.color
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      font.bold: true
+    }
+
+    Column {
+      id: rowTxt
+      anchors.top: canvas.bottom
+      anchors.topMargin: Style.space(2)
+      anchors.horizontalCenter: parent.horizontalCenter
+      spacing: 0
+      Text {
+        text: dial.label + " · " + dial.line1
+        color: dial.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        text: dial.line2
+        color: Qt.rgba(dial.foreground.r, dial.foreground.g, dial.foreground.b, 0.55)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
       }
     }
   }

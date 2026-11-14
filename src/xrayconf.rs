@@ -33,6 +33,7 @@ pub fn build(server: &Server, st: &Settings, with_tun: bool) -> Value {
             "protocol": "tun",
             "settings": {
                 "network": "tun",
+                "name": "omaxy0",
                 "address": [server_tun_address(st)],
                 "gateway": st.tun_gateway,
                 "mtu": 9000,
