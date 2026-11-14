@@ -591,7 +591,8 @@ Panel {
           anchors.leftMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
           visible: root.daemonUp
-          text: root.confirmStopDaemon ? "стоп демон — подтвердить?" : "⏻ стоп"
+          // короткий текст: кнопка в плотном ряду, длинная фраза вылезала за ряд
+          text: root.confirmStopDaemon ? "⏻ ещё раз" : "⏻ стоп"
           fontSize: Style.font.bodySmall
           foreground: root.confirmStopDaemon ? Qt.rgba(0.95, 0.4, 0.35, 1) : root.fg
           accent: Commons.Color.accent
@@ -798,9 +799,7 @@ Panel {
 
         Button {
           width: parent.width
-          text: root.confirmApply
-            ? "применить и перезапустить подключение — подтвердить?"
-            : "Применить"
+          text: root.confirmApply ? "подтвердить применение?" : "Применить"
           fontSize: Style.font.bodySmall
           foreground: root.confirmApply ? Commons.Color.accent : root.fg
           accent: Commons.Color.accent
