@@ -35,6 +35,7 @@ Panel {
   property var pingQueue: []
   property bool pingBusy: false
   property string pingCurrent: ""
+  property bool pingAllBusy: false
 
   // настройки прокси (омaxy Settings) — черновик для редактирования
   property bool cfgOpen: false
@@ -104,6 +105,26 @@ Panel {
     var p = Object.assign({}, root.pings)
     p[id] = obj
     root.pings = p
+  }
+
+  // пинг всего списка: все строки в «…», кнопка гаснет до конца цикла
+  function pingAll() {
+    if (root.pingAllBusy) return
+    root.pingAllBusy = true
+    var p = {}
+    for (var i = 0; i < root.servers.length; i++) p[root.servers[i].id] = { busy: true, ms: -1 }
+    root.pings = p
+    procPingAll.running = true
+  }
+
+  function applyPingAll(text) {
+    var arr = []
+    try { arr = JSON.parse(String(text || "[]")) } catch (e) { }
+    var p = Object.assign({}, root.pings)
+    for (var i = 0; i < arr.length; i++)
+      p[arr[i].id] = { busy: false, ms: arr[i].ok === true ? arr[i].min_ms : -1 }
+    root.pings = p
+    root.pingAllBusy = false
   }
 
   function pingServer(id) {
@@ -241,6 +262,14 @@ Panel {
     }
   }
 
+  // цикл пинга по всему списку (параллельно на стороне CLI)
+  Process {
+    id: procPingAll
+    command: [root.cli, "ping", "--all", "--json"]
+    stdout: StdioCollector { onStreamFinished: root.applyPingAll(text) }
+    onExited: (code) => { root.pingAllBusy = false }
+  }
+
   Timer {
     interval: 2500
     repeat: true
@@ -351,20 +380,16 @@ Panel {
           anchors.left: mainBtn.right
           anchors.leftMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
-          text: "⚡ пинг"
+          text: root.pingAllBusy ? "⚡ пинг…" : "⚡ пинг"
           fontSize: Style.font.bodySmall
           foreground: root.fg
           accent: Commons.Color.accent
           bordered: true
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(2)
-          enabled: !root.pingBusy && root.servers.length > 0
-          // пинг активного сервера; если не выбран — первого видимого
-          onClicked: {
-            var id = root.active.id
-            if (id === undefined && root.servers.length > 0) id = root.servers[0].id
-            if (id !== undefined) root.pingServer(id)
-          }
+          // дезактивирована на всё время цикла пинга
+          enabled: !root.pingAllBusy && !root.pingBusy && root.servers.length > 0
+          onClicked: root.pingAll()
         }
 
         Text {

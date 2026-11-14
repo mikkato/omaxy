@@ -403,8 +403,11 @@ fn cli_status(args: &[String]) -> Result<(), String> {
 }
 
 /// TCP connect latency to the server endpoint (ICMP rarely works on proxy ports):
-/// 3 attempts, min/median in ms.
+/// 3 attempts, min/median in ms. With --all: one probe per server, parallel.
 fn cli_ping(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--all") {
+        return cli_ping_all();
+    }
     let json_out = args.iter().any(|a| a == "--json");
     let sel = args.iter().find(|a| !a.starts_with("--")).cloned();
     let cfg = store::load();
@@ -647,4 +650,48 @@ fn cli_config(args: &[String]) -> Result<(), String> {
 
 fn store_valid_v4(s: &str) -> bool {
     !s.is_empty() && s.split('.').count() == 4 && s.split('.').all(|o| o.parse::<u8>().is_ok())
+}
+
+/// Ping every known server: parallel TCP connect probes (16-wide), JSON array out.
+fn cli_ping_all() -> Result<(), String> {
+    use std::sync::mpsc;
+    use std::thread;
+    let cfg = store::load();
+    let servers: Vec<_> = cfg.all_servers().into_iter().cloned().collect();
+    if servers.is_empty() {
+        println!("[]");
+        return Ok(());
+    }
+    let (tx, rx) = mpsc::channel::<Value>();
+    let chunks: Vec<Vec<_>> = {
+        let n = 32usize;
+        let mut v: Vec<Vec<_>> = (0..n).map(|_| Vec::new()).collect();
+        for (i, s) in servers.iter().enumerate() {
+            v[i % n].push(s.clone());
+        }
+        v
+    };
+    for chunk in chunks {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for s in chunk {
+                let mut out = json!({"id": s.id, "ok": false, "min_ms": null});
+                let target = format!("{}:{}", s.address, s.port);
+                use std::net::ToSocketAddrs;
+                if let Some(addr) = target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                    let t0 = std::time::Instant::now();
+                    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2500)).is_ok() {
+                        out["ok"] = json!(true);
+                        out["min_ms"] = json!(t0.elapsed().as_millis());
+                    }
+                }
+                let _ = tx.send(out);
+            }
+        });
+    }
+    drop(tx);
+    let mut results: Vec<Value> = rx.iter().collect();
+    results.sort_by_key(|r| r["id"].as_str().unwrap_or("").to_string());
+    println!("{}", serde_json::to_string(&results).unwrap());
+    Ok(())
 }
