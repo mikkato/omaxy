@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "mikkato.omaxy",
+  "name": "Proxy (omaxy)",
+  "version": "0.1.0",
+  "author": "mikkato",
+  "description": "Xray-прокси (omaxy): in/out TUN, выбор сервера, статус; wire-совместим с happd",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Proxy omaxy",
+    "description": "Статус omaxy-прокси: подключено/нет, сервер; клик — панель выбора и in/out",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

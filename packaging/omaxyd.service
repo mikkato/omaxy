@@ -1,0 +1,16 @@
+[Unit]
+Description=omaxy proxy daemon (happd-compatible process control)
+After=network.target
+
+[Service]
+Type=simple
+# Socket по умолчанию /tmp/happd.sock — для совместимости с оригинальным Happ client.
+# Свой путь: Environment=OMAXY_SOCK=/run/omaxy/omaxy.sock
+Environment=OMAXY_SOCK=/tmp/happd.sock
+ExecStart=/usr/local/bin/omaxy daemon
+Restart=always
+RestartSec=3
+# Демон управляет TUN/xray от root (как happd): без песочниц — они ломают TUN.
+
+[Install]
+WantedBy=multi-user.target

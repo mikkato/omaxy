@@ -1,0 +1,5 @@
+post_install() {
+  echo "Включи демон: sudo systemctl enable --now omaxyd"
+  echo "Модуль панели: cp -r /usr/share/omaxy/plugin ~/.config/omarchy/plugins/mikkato.omaxy && omarchy restart shell"
+}
+post_upgrade() { post_install; }
