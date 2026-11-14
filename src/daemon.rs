@@ -395,7 +395,7 @@ fn handle_action(
                     };
                     for p in back {
                         if std::path::Path::new(&format!("/proc/{p}")).exists()
-                            && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok() {
+                            && bypass_put_back(p, &src) {
                             n += 1;
                         }
                     }
@@ -420,10 +420,9 @@ fn handle_action(
             };
             let mut n = 0;
             for (src, pids) in groups {
-                let srcpath = format!("/sys/fs/cgroup{src}");
                 for p in pids {
                     if std::path::Path::new(&format!("/proc/{p}")).exists()
-                        && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok() {
+                        && bypass_put_back(p, &src) {
                         n += 1;
                     }
                 }
@@ -899,16 +898,61 @@ fn pid_cgroup(pid: u32) -> Option<String> {
 }
 
 /// перенести все процессы из cgroup `src` в dst (или в src при обратном); возвращает число
+fn ancestor_pids(mut p: u32) -> Vec<u32> {
+    let mut v = vec![p];
+    for _ in 0..32 {
+        let Ok(s) = std::fs::read_to_string(format!("/proc/{p}/status")) else { break };
+        let Some(pp) = s.lines().find(|l| l.starts_with("PPid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|x| x.parse::<u32>().ok()) else { break };
+        if pp == 0 || pp == 1 || v.contains(&pp) { break }
+        v.push(pp);
+        p = pp;
+    }
+    v
+}
+
 fn bypass_move_all(src: &str, dst_cg: &str) -> usize {
     let procs = std::path::Path::new(src).join("cgroup.procs");
     let Ok(list) = std::fs::read_to_string(&procs) else { return 0 };
+    let skip = ancestor_pids(std::process::id());
     let mut n = 0;
     for p in list.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+        if skip.contains(&p) { continue }
         if std::fs::write(format!("{dst_cg}/cgroup.procs"), format!("{p}\n")).is_ok() {
             n += 1;
         }
     }
     n
+}
+
+fn proc_uid(p: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{p}/status")).ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok()))
+        .unwrap_or(1000)
+}
+
+/// резервный cgroup для возврата, если исходный scope уже уничтожен systemd
+fn bypass_restore_cg(uid: u32) -> String {
+    if uid == 0 {
+        "/sys/fs/cgroup/system.slice/omaxy-restore.scope".into()
+    } else {
+        format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/omaxy-restore.scope")
+    }
+}
+
+fn bypass_put_back(p: u32, src: &str) -> bool {
+    let srcpath = format!("/sys/fs/cgroup{src}");
+    if std::path::Path::new(&format!("{srcpath}/cgroup.procs")).exists()
+        && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok()
+    {
+        return true;
+    }
+    let cg = bypass_restore_cg(proc_uid(p));
+    let _ = std::fs::create_dir_all(&cg);
+    std::fs::write(format!("{cg}/cgroup.procs"), format!("{p}\n")).is_ok()
 }
 
 fn bypass_members() -> Vec<u32> {
