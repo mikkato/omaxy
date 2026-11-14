@@ -261,3 +261,56 @@ fn build_outbound(server: &Server) -> Value {
         }),
     }
 }
+
+/// Конфиг sing-box в точности по образцу Happ TTunConfigurator (см.
+/// docs/RESEARCH-happ-4.7.2.md): TUN c auto_route/strict_route поверх SOCKS xray,
+/// собственные процессы ядра — direct, DNS перехватывается внутри туннеля.
+pub fn build_singbox(st: &Settings, iface: &str) -> Value {
+    let mut addr = vec![st.tun_address.clone()];
+    // Happ добавляет IPv6-адрес только когда он задан; у нас префикса ULA нет — не добавляем
+    json!({
+        "log": { "level": "info", "timestamp": true },
+        "dns": { "servers": [
+            { "type": "udp", "tag": "dns-proxy",
+              "server": st.dns.first().cloned().unwrap_or_else(|| "8.8.8.8".into()),
+              "detour": "proxy" }
+        ]},
+        "inbounds": [
+            { "type": "tun", "tag": "tun-in", "interface_name": iface,
+              "address": addr, "mtu": 1500,
+              "auto_route": true, "strict_route": true, "stack": "mixed" }
+        ],
+        "outbounds": [
+            { "type": "socks", "tag": "proxy", "server": "127.0.0.1",
+              "server_port": st.socks_port, "udp_fragment": true,
+              "domain_resolver": { "type": "server", "server": "dns-proxy" } },
+            { "type": "direct", "tag": "direct",
+              "domain_resolver": { "type": "server", "server": "dns-proxy" } }
+        ],
+        "route": {
+            "final": "proxy",
+            "auto_detect_interface": true,
+            "rules": [
+                { "process_name": if st.direct_apps.is_empty() {
+                        vec!["omaxy".to_string(), "xray".to_string(), "sing-box".to_string()]
+                    } else { st.direct_apps.clone() },
+                  "outbound": "direct" },
+                { "action": "sniff" },
+                { "protocol": "dns", "action": "hijack-dns" }
+            ]
+        }
+    })
+}
+
+/// путь к sing-box: настройки → ~/.local/share/omaxy → /usr/bin
+pub fn resolve_singbox(st: &Settings) -> Option<String> {
+    let mut cands: Vec<String> = Vec::new();
+    if !st.singbox_path.is_empty() {
+        cands.push(st.singbox_path.clone());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        cands.push(format!("{}/.local/share/omaxy/sing-box", home.to_string_lossy()));
+    }
+    cands.push("/usr/bin/sing-box".into());
+    cands.into_iter().find(|p| std::path::Path::new(p).exists())
+}

@@ -295,7 +295,13 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
             cfg.settings.xray_path
         ));
     }
-    let conf = xrayconf::build(&server, &cfg.settings, cfg.settings.tun);
+    // движок TUN как у Happ: sing-box поверх локального SOCKS xray
+    let singbox = cfg.settings.tun && cfg.settings.tun_engine == "singbox";
+    let sb_path = if singbox {
+        Some(xrayconf::resolve_singbox(&cfg.settings)
+            .ok_or("sing-box не найден: установи или укажи singbox_path")?)
+    } else { None };
+    let conf = xrayconf::build(&server, &cfg.settings, cfg.settings.tun && !singbox);
     let conf_str = serde_json::to_string_pretty(&conf).unwrap();
     let mut c = Conn::open()?;
     let put = c.call(json!({
@@ -309,7 +315,8 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
         "process-id": "omaxy-xray",
         "executable": cfg.settings.xray_path,
         "arguments": ["run", "-c", "/var/lib/omaxy/xray-active.json"],
-        "environment": tun_env_map(&server, &cfg.settings),
+        "environment": if singbox { serde_json::json!({}) }
+                       else { serde_json::Value::Object(tun_env_map(&server, &cfg.settings)) },
         "auto-restart": true,
         "max-restart-attempts": 5,
         "restart-delay-ms": 3000,
@@ -318,6 +325,37 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
     }))?;
     if !start.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err(format!("start failed: {start}"));
+    }
+    if let Some(sb) = &sb_path {
+        let sbconf = xrayconf::build_singbox(&cfg.settings, "omaxy0");
+        let put2 = c.call(json!({
+            "action": "omaxy-put", "path": "singbox-active.json",
+            "content": serde_json::to_string_pretty(&sbconf).unwrap(), "request-id": 6
+        }))?;
+        if !put2.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(format!("singbox put failed: {put2}"));
+        }
+        let s2 = c.call(json!({
+            "action": "start",
+            "process-id": "omaxy-singbox",
+            "executable": sb,
+            "arguments": ["run", "-c", "/var/lib/omaxy/singbox-active.json"],
+            "environment": { "OMAXY_TUN_ENGINE": "singbox", "OMAXY_TUN_IF": "omaxy0" },
+            "auto-restart": true,
+            "max-restart-attempts": 5,
+            "restart-delay-ms": 3000,
+            "detached": true,
+            "request-id": 7
+        }))?;
+        if !s2.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let _ = c.call(json!({"action":"stop","process-id":"omaxy-xray","request-id":8}));
+            return Err(format!("sing-box start failed: {s2}"));
+        }
+        // ждём появления интерфейса (sing-box поднимает его сам)
+        for _ in 0..40 {
+            if std::path::Path::new("/sys/class/net/omaxy0").exists() { break }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
     let mut cfg2 = cfg.clone();
     cfg2.active = Some(server.id.clone());
@@ -333,6 +371,9 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
 
 fn cli_disconnect() -> Result<(), String> {
     let mut c = Conn::open()?;
+    let _ = c.call(json!({
+        "action": "stop", "process-id": "omaxy-singbox", "request-id": 6
+    }));
     let r = c.call(json!({
         "action": "stop", "process-id": "omaxy-xray", "request-id": 4
     }))?;

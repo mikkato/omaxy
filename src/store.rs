@@ -29,6 +29,23 @@ pub struct Settings {
     /// включать TUN-inbound (режим «всё через туннель»); false — только socks/http
     #[serde(default = "default_true")]
     pub tun: bool,
+    /// TUN-движок: "singbox" (как Happ: sing-box auto_route поверх socks xray) или "xray" (legacy)
+    #[serde(default = "default_engine")]
+    pub tun_engine: String,
+    /// путь к sing-box; пусто = ~/.local/share/omaxy/sing-box или /usr/bin/sing-box
+    #[serde(default)]
+    pub singbox_path: String,
+    /// процессы, всегда идущие мимо туннеля (process_name → direct в sing-box)
+    #[serde(default = "default_direct_apps")]
+    pub direct_apps: Vec<String>,
+}
+
+fn default_engine() -> String {
+    "singbox".into()
+}
+
+fn default_direct_apps() -> Vec<String> {
+    vec!["omaxy".into(), "xray".into(), "sing-box".into(), "Hermes".into()]
 }
 
 fn default_true() -> bool {
@@ -43,6 +60,9 @@ impl Default for Settings {
             dns: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             route_mode: "direct-local".into(),
             xray_path: "/usr/bin/xray".into(),
+            tun_engine: default_engine(),
+            singbox_path: String::new(),
+            direct_apps: default_direct_apps(),
             tun_address: "10.77.0.1/30".into(),
             tun_gateway: "10.77.0.2".into(),
             tun: true,
