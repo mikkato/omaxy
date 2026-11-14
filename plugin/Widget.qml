@@ -18,6 +18,16 @@ BarWidget {
   property var servers: []
   property real rxRate: 0
   property real txRate: 0
+  // история скоростей для линейных графиков панели (копится всегда, не только при открытой панели)
+  property var rxHist: []
+  property var txHist: []
+
+  function pushHist(v: real) {
+    root.rxHist = root.rxHist.concat([v]).slice(-120)
+  }
+  function pushHistTx(v: real) {
+    root.txHist = root.txHist.concat([v]).slice(-120)
+  }
   property var prevSample: null
 
   readonly property string cli: Quickshell.env("HOME") + "/.local/bin/omaxy"
@@ -41,8 +51,11 @@ BarWidget {
     var t = s.traffic
     if (!root.connected || !t || t.rx === undefined) {
       prevSample = null
+      if (rxHist.length > 0 && rxHist[rxHist.length - 1] === 0) return
       rxRate = 0
       txRate = 0
+      pushHist(0)
+      pushHistTx(0)
       return
     }
     if (prevSample) {
@@ -51,6 +64,8 @@ BarWidget {
         rxRate = Math.max(0, (t.rx - prevSample.rx) / dt)
         txRate = Math.max(0, (t.tx - prevSample.tx) / dt)
         prevSample = { t: now, rx: t.rx, tx: t.tx }
+        pushHist(rxRate)
+        pushHistTx(txRate)
       }
     } else {
       prevSample = { t: now, rx: t.rx, tx: t.tx }

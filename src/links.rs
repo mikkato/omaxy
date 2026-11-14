@@ -32,6 +32,10 @@ pub struct Server {
     pub sid: Option<String>,
     pub fp: Option<String>,
     pub public_key: Option<String>, // hysteria2
+    pub pepper: Option<String>,   // hysteria2 obfs (salamander) password
+    pub finalmask: Option<String>, // hysteria2 "fm" JSON (xray finalmask/salamander)
+    pub upmbps: Option<String>,
+    pub downmbps: Option<String>,
     pub insecure: bool,
     pub service_name: Option<String>, // grpc
     pub path: Option<String>,
@@ -96,6 +100,10 @@ pub fn from_uri(uri: &str) -> Result<Server, String> {
         sid: q(&url, "sid"),
         fp: q(&url, "fp"),
         public_key: q(&url, "pubkey").or_else(|| q(&url, "pk")),
+        pepper: q(&url, "pepper").or_else(|| q(&url, "obfs-password")),
+        finalmask: q(&url, "fm"),
+        upmbps: q(&url, "upmbps").or_else(|| q(&url, "UP")),
+        downmbps: q(&url, "downmbps").or_else(|| q(&url, "DP")),
         insecure: q(&url, "insecure").as_deref() == Some("1"),
         service_name: q(&url, "serviceName").or_else(|| q(&url, "mode")),
         path: q(&url, "path").or_else(|| q(&url, "serviceName")),
@@ -172,6 +180,10 @@ fn from_vmess(uri: &str) -> Result<Server, String> {
         sid: g("sid"),
         fp: g("fp"),
         public_key: None,
+        pepper: None,
+        finalmask: None,
+        upmbps: None,
+        downmbps: None,
         insecure: g("allowInsecure").as_deref() == Some("1"),
         service_name: if g("type").is_some() { g("path") } else { None },
         path: g("path"),

@@ -289,9 +289,6 @@ fn cli_connect(args: &[String]) -> Result<(), String> {
         None => cfg.all_servers().first().map(|s| (*s).clone()),
     }
     .ok_or("сервер не найден; список: omaxy server list")?;
-    if server.kind == links::ServerKind::Hysteria2 {
-        return Err("hysteria2 в генераторе xray-конфига пока не поддерживается".into());
-    }
     if !std::path::Path::new(&cfg.settings.xray_path).exists() {
         return Err(format!(
             "xray не найден: {} — установи (pacman -S xray) или укажи путь: omaxy config set xray_path <path>",
@@ -432,6 +429,17 @@ fn tun_env_map(server: &links::Server, st: &store::Settings) -> serde_json::Map<
         "OMAXY_TUN_SERVER".into(),
         serde_json::json!(format!("{}:{}", server.address, server.port)),
     );
+    // резолвим адрес сервера здесь (DNS клиента заведомо живой) — демон может
+    // не разрешить имя в момент подъёма интерфейса
+    {
+        use std::net::ToSocketAddrs;
+        if let Ok(addrs) = (server.address.as_str(), 0u16).to_socket_addrs() {
+        let ips: Vec<String> = addrs.filter(|a| a.is_ipv4()).map(|a| a.ip().to_string()).collect();
+        if !ips.is_empty() {
+            m.insert("OMAXY_TUN_SERVER_IPS".into(), serde_json::json!(ips.join(",")));
+        }
+        }
+    }
     m.insert("OMAXY_TUN_DNS".into(), serde_json::json!(st.dns.join(",")));
     m
 }

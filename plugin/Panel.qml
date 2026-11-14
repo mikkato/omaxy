@@ -28,6 +28,8 @@ Panel {
   // скорость, Б/с — из дельты кумулятивных счётчиков TUN
   property real rxRate: 0
   property real txRate: 0
+  property var rxHist: []
+  property var txHist: []
   property var prevSample: null
 
   // пинги: id -> {ms: number|-1, busy: bool}
@@ -87,6 +89,19 @@ Panel {
     if (d > 0) return d + "д " + h + "ч"
     if (h > 0) return h + "ч " + m + "м"
     return m + "м " + (s % 60) + "с"
+  }
+  function fmtBpsPad(n) {
+    var v
+    if (n >= 1048576) v = (n / 1048576).toFixed(1)
+    else if (n >= 1024) v = String(Math.round(n / 1024))
+    else v = String(Math.round(n))
+    while (v.length < 3) v = "0" + v
+    return v
+  }
+  function unitBps(n) {
+    if (n >= 1048576) return "М"
+    if (n >= 1024) return "К"
+    return "Б"
   }
   function fmtBpsFull(n) {
     return fmtBps(n) + " Б/с"
@@ -219,6 +234,8 @@ Panel {
       prevSample = null
       rxRate = 0
       txRate = 0
+      rxHist = []
+      txHist = []
       return
     }
     if (prevSample) {
@@ -237,6 +254,7 @@ Panel {
     if (opened) {
       refresh()
       Qt.callLater(fillCfg)
+      Qt.callLater(refreshTasks)
     }
   }
 
@@ -293,6 +311,76 @@ Panel {
     command: [root.cli, "ping", "--all", "--json"]
     stdout: StdioCollector { onStreamFinished: root.applyPingAll(text) }
     onExited: (code) => { root.pingAllBusy = false }
+  }
+
+  // ── обход туннеля: задачи и очередь действий к демону
+  property var tasks: []
+  property var taskApps: []
+  property var bypassPids: []
+  property var bypQueue: []
+  property var bypCurrent: null
+
+  function refreshTasks() {
+    if (!procTasks.running) procTasks.running = true
+    if (!procBypList.running) procBypList.running = true
+  }
+
+  function applyTasks(text) {
+    var list = []
+    try { list = JSON.parse(String(text || "[]")) } catch (e) { }
+    var seen = {}, apps = []
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i]
+      if (!c.pid) continue
+      var cls = c.initialClass || c.class || "?"
+      if (seen[cls] === undefined) { seen[cls] = apps.length; apps.push({ cls: cls, pids: [] }) }
+      apps[seen[cls]].pids.push(c.pid)
+    }
+    for (var k = 0; k < apps.length; k++) apps[k].count = apps[k].pids.length + " ок."
+    root.taskApps = apps
+  }
+
+  function applyBypList(text) {
+    var r = {}
+    try { r = JSON.parse(String(text || "{}")) } catch (e) { }
+    root.bypassPids = (r.pids || []).map(function (p) { return +p })
+  }
+
+  function bypEnqueue(op) {
+    root.bypQueue = root.bypQueue.concat([op])
+    if (root.bypCurrent === null) root.bypPump()
+  }
+
+  function bypPump() {
+    if (root.bypQueue.length === 0) { root.bypCurrent = null; return }
+    root.bypCurrent = root.bypQueue[0]
+    procBypAct.running = true
+  }
+
+  Process {
+    id: procTasks
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector { onStreamFinished: root.applyTasks(text) }
+  }
+
+  Process {
+    id: procBypList
+    command: [root.cli, "call", "bypass-list"]
+    stdout: StdioCollector { onStreamFinished: root.applyBypList(text) }
+  }
+
+  Process {
+    id: procBypAct
+    readonly property var cur: root.bypCurrent
+    command: cur && cur.op === "clear"
+      ? [root.cli, "call", "bypass-clear"]
+      : [root.cli, "call", "bypass-" + (cur ? cur.op : "list"),
+         JSON.stringify({ pid: cur ? cur.pid : 0 })]
+    onExited: (code) => {
+      root.bypQueue = root.bypQueue.slice(1)
+      if (!procBypList.running) procBypList.running = true
+      Qt.callLater(root.bypPump)
+    }
   }
 
   Timer {
@@ -422,7 +510,11 @@ Panel {
         interval: 1000
         running: root.connected
         repeat: true
-        onTriggered: root.now = Date.now() / 1000
+        onTriggered: {
+          root.now = Date.now() / 1000
+          root.rxHist = root.rxHist.concat([root.rxRate]).slice(-60)
+          root.txHist = root.txHist.concat([root.txRate]).slice(-60)
+        }
       }
 
       // ── органы управления (над списком)
@@ -734,38 +826,39 @@ Panel {
         }
       }
 
-      // ── трафик: две круговые диаграммы (доля приёма/передачи)
+      // ── трафик: линейные графики скоростей
       Row {
         visible: root.daemonUp
         width: parent.width
-        spacing: Style.space(16)
+        height: implicitHeight
+        spacing: Style.space(14)
 
-        TrafficDial {
-          id: dialRx
-          label: "Приём"
+        TrafficGraph {
+          id: graphRx
+          label: "↓ приём"
           color: root.rxColor
           foreground: root.fg
-          fraction: root.rxTotal + root.txTotal > 0
-            ? root.rxTotal / (root.rxTotal + root.txTotal) : 0
-          line1: root.fmtBpsFull(root.rxRate)
-          line2: "всего " + root.fmtBytes(root.rxTotal)
+          history: root.hostWidget && root.hostWidget.rxHist !== undefined
+            ? root.hostWidget.rxHist : root.rxHist
+          line1: "скор " + root.fmtBpsPad(root.rxRate) + root.unitBps(root.rxRate) + "/с"
+          line2: "всег " + root.fmtBytes(root.rxTotal)
         }
 
-        TrafficDial {
-          id: dialTx
-          label: "Передача"
+        TrafficGraph {
+          id: graphTx
+          label: "↑ передача"
           color: root.txColor
           foreground: root.fg
-          fraction: root.rxTotal + root.txTotal > 0
-            ? root.txTotal / (root.rxTotal + root.txTotal) : 0
-          line1: root.fmtBpsFull(root.txRate)
-          line2: "всего " + root.fmtBytes(root.txTotal)
+          history: root.hostWidget && root.hostWidget.txHist !== undefined
+            ? root.hostWidget.txHist : root.txHist
+          line1: "скор " + root.fmtBpsPad(root.txRate) + root.unitBps(root.txRate) + "/с"
+          line2: "всег " + root.fmtBytes(root.txTotal)
         }
 
         // подписки — справом столбцом той же строки
         Column {
           width: Math.max(Style.space(90),
-            parent.width - dialRx.implicitWidth - dialTx.implicitWidth - 2 * Style.space(16))
+            parent.width - graphRx.implicitWidth - graphTx.implicitWidth - 2 * Style.space(14))
           visible: root.subs.length > 0
           spacing: 0
           Text {
@@ -800,7 +893,109 @@ Panel {
         }
       }
 
+      // ── обход туннеля: приложения из списка задач
+      Row {
+        visible: root.daemonUp && root.connected
+        width: parent.width
+        spacing: Style.space(8)
+        Text {
+            text: "Обход туннеля — приложения"
+            anchors.verticalCenter: parent.verticalCenter
+            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+        }
+        Button {
+            text: "⟳"
+            fontSize: Style.font.caption
+            foreground: root.fg
+            accent: Commons.Color.accent
+            onClicked: root.refreshTasks()
+        }
+        Button {
+            visible: root.bypassPids.length > 0
+            text: "сбросить"
+            fontSize: Style.font.caption
+            foreground: root.fg
+            accent: Commons.Color.accent
+            onClicked: root.bypEnqueue({ op: "clear", pid: 0 })
+        }
+      }
+
+      Flickable {
+        visible: root.daemonUp && root.connected && root.tasks.length > 0
+        width: parent.width
+        height: Math.min(taskCol.implicitHeight, Style.space(140))
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        contentHeight: taskCol.implicitHeight
+        contentWidth: width
+        ScrollIndicator.vertical: ScrollIndicator { }
+
+        Column {
+          id: taskCol
+          width: parent.width
+
+          Repeater {
+            model: root.taskApps
+
+            Item {
+              required property var modelData
+              width: taskCol.width
+              height: Style.space(20)
+              readonly property bool on: modelData.pids.some(
+                p => root.bypassPids.indexOf(p) >= 0)
+
+              Row {
+                anchors.fill: parent
+                spacing: Style.space(6)
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: parent.on ? "◉" : "○"
+                  color: parent.on ? Commons.Color.accent
+                                   : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.45)
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: taskCol.width - Style.space(40)
+                  text: modelData.cls + "  ·  " + modelData.count
+                  color: parent.on ? root.fg
+                                   : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.75)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (parent.on)
+                    root.bypEnqueue({ op: "remove", pid: modelData.pids[0] })
+                  else
+                    for (var i = 0; i < modelData.pids.length; i++)
+                      root.bypEnqueue({ op: "add", pid: modelData.pids[i] })
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Text {
+        visible: root.daemonUp && root.connected && root.bypassPids.length > 0
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: "отмеченные приложения ходят напрямую, мимо туннеля (новые соединения)"
+        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
       // ── серверы: компактный прокручиваемый список с пингом
+      Item { width: parent.width; height: Style.space(6) }
       Text {
         text: "Серверы (" + root.servers.length + ")"
         visible: root.servers.length > 0
@@ -934,73 +1129,89 @@ Panel {
   }
 
   // ── круговая диаграмма трафика (пончик с долей)
-  component TrafficDial: Item {
-    id: dial
+  component TrafficGraph: Item {
+    id: gr
     property string label: ""
     property color color: Commons.Color.accent
     property color foreground: Commons.Color.foreground
-    property real fraction: 0
+    property var history: []
     property string line1: ""
     property string line2: ""
-    readonly property real dialSize: Style.space(46)
-    implicitWidth: Math.max(dialSize, rowTxt.implicitWidth)
-    implicitHeight: dialSize + Style.space(2) + rowTxt.implicitHeight
+    implicitWidth: Style.space(150)
+    implicitHeight: gcap.implicitHeight + canvas.height + Style.space(2)
+        + infoCol.implicitHeight
+    // Row раскладывает по width/height, а Item без них имеет ширину 0 —
+    // без этих привязок графики рисовались друг поверх друга
+    width: implicitWidth
+    height: implicitHeight
 
-    onFractionChanged: canvas.requestPaint()
+    onHistoryChanged: canvas.requestPaint()
     onColorChanged: canvas.requestPaint()
+
+    Text {
+      id: gcap
+      text: gr.label
+      color: Qt.rgba(gr.foreground.r, gr.foreground.g, gr.foreground.b, 0.55)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
 
     Canvas {
       id: canvas
-      width: dial.dialSize
-      height: dial.dialSize
+      anchors.top: gcap.bottom
+      anchors.left: parent.left
+      anchors.right: parent.right
+      height: Style.space(22)
       onPaint: {
         var ctx = getContext("2d")
         ctx.clearRect(0, 0, width, height)
-        var lw = width * 0.16
-        var r = (width - lw) / 2
-        var cx = width / 2
+        // базовая линия видна всегда, даже без данных (как в llmctl-gui)
+        ctx.strokeStyle = Qt.rgba(1, 1, 1, 0.15)
+        ctx.lineWidth = 1
         ctx.beginPath()
-        ctx.arc(cx, cx, r, 0, 2 * Math.PI)
-        ctx.lineWidth = lw
-        ctx.strokeStyle = Qt.rgba(dial.foreground.r, dial.foreground.g, dial.foreground.b, 0.14)
+        ctx.moveTo(0, height - 0.5)
+        ctx.lineTo(width, height - 0.5)
         ctx.stroke()
-        if (dial.fraction > 0.003) {
-          ctx.beginPath()
-          var a0 = -Math.PI / 2
-          ctx.arc(cx, cx, r, a0, a0 + 2 * Math.PI * Math.min(1, dial.fraction))
-          ctx.lineWidth = lw
-          ctx.lineCap = "round"
-          ctx.strokeStyle = Qt.rgba(dial.color.r, dial.color.g, dial.color.b, 0.95)
-          ctx.stroke()
+        var h = gr.history
+        if (!h || h.length < 2) { return }
+        var mx = 1024
+        for (var i = 0; i < h.length; i++) { if (h[i] > mx) mx = h[i] }
+        var base = height - 1.5
+        ctx.beginPath()
+        ctx.moveTo(0, base)
+        for (var j = 0; j < h.length; j++) {
+          var x = j / (h.length - 1) * width
+          var y = base - (h[j] / mx) * (height - 4)
+          ctx.lineTo(x, y)
         }
+        ctx.strokeStyle = Qt.rgba(gr.color.r, gr.color.g, gr.color.b, 0.95)
+        ctx.lineWidth = 1.5
+        ctx.lineJoin = "round"
+        ctx.stroke()
+        ctx.lineTo(width, base)
+        ctx.lineTo(0, base)
+        ctx.closePath()
+        ctx.fillStyle = Qt.rgba(gr.color.r, gr.color.g, gr.color.b, 0.14)
+        ctx.fill()
       }
-    }
-
-    Text {
-      anchors.centerIn: canvas
-      text: Math.round(dial.fraction * 100) + "%"
-      color: dial.color
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
-      font.bold: true
     }
 
     Column {
-      id: rowTxt
+      id: infoCol
       anchors.top: canvas.bottom
-      anchors.topMargin: Style.space(2)
-      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.topMargin: 1
+      anchors.left: parent.left
       spacing: 0
       Text {
-        text: dial.label + " · " + dial.line1
-        color: dial.foreground
-        font.family: Style.font.family
+        text: gr.line1
+        color: gr.foreground
+        font.family: "monospace"
         font.pixelSize: Style.font.caption
       }
       Text {
-        text: dial.line2
-        color: Qt.rgba(dial.foreground.r, dial.foreground.g, dial.foreground.b, 0.55)
-        font.family: Style.font.family
+        text: gr.line2
+        color: Qt.rgba(gr.foreground.r, gr.foreground.g, gr.foreground.b, 0.55)
+        font.family: "monospace"
         font.pixelSize: Style.font.caption
       }
     }

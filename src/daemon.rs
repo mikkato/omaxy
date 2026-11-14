@@ -64,6 +64,10 @@ impl Daemon {
     pub fn run(&self) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
         std::fs::create_dir_all(LIB_DIR).ok();
+        // обход приложений переживает перезапуск демона
+        if !bypass_members().is_empty() {
+            bypass_apply();
+        }
         // при старте убираем osиротевший xray от прошлых жизней (иначе "device busy")
         let _ = std::process::Command::new("pkill")
             .args(["-9", "-f", "xray run -c /var/lib/omaxy/"])
@@ -347,6 +351,86 @@ fn handle_action(
                         "processes": list, "daemon-version": DAEMON_VERSION}))
         }
         "clear-logs" => Some(ok(action, "logs cleared")),
+                "bypass-add" => {
+            let pid = msg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            match pid_cgroup(pid) {
+                None => Some(json!({"success": false, "action": action, "error": "нет такого pid"})),
+                Some(src) if src.starts_with("/omaxy-bypass") =>
+                    Some(json!({"success": true, "action": action, "moved": 0, "note": "already"})),
+                Some(src) => {
+                    bypass_apply(); // каталог-приёмник должен существовать до переноса
+                    let srcpath = format!("/sys/fs/cgroup{src}");
+                    let pre: Vec<u32> = std::fs::read_to_string(format!("{srcpath}/cgroup.procs"))
+                        .unwrap_or_default().lines()
+                        .filter_map(|l| l.trim().parse::<u32>().ok()).collect();
+                    let n = bypass_move_all(&srcpath, BYPASS_CG);
+                    {
+                        let mut m = bypass_map().lock().unwrap();
+                        for p in pre { m.insert(p, src.clone()); }
+                    }
+                    bypass_map_save();
+                    bypass_apply();
+                    Some(json!({"success": true, "action": action, "moved": n, "src": src}))
+                }
+            }
+        }
+"bypass-remove" => {
+            let pid = msg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let src = {
+                let m = bypass_map().lock().unwrap();
+                m.get(&pid).cloned().or_else(|| {
+                    bypass_members().iter().find_map(|p| m.get(p).cloned())
+                })
+            };
+            match src {
+                Some(src) => {
+                    let srcpath = format!("/sys/fs/cgroup{src}");
+                    let mut n = 0;
+                    let back: Vec<u32> = {
+                        let mut m = bypass_map().lock().unwrap();
+                        let v: Vec<u32> = m.iter().filter(|(_, s)| **s == src)
+                            .map(|(p, _)| *p).collect();
+                        for p in &v { m.remove(p); }
+                        v
+                    };
+                    for p in back {
+                        if std::path::Path::new(&format!("/proc/{p}")).exists()
+                            && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok() {
+                            n += 1;
+                        }
+                    }
+                    bypass_map_save();
+                    Some(json!({"success": true, "action": action, "moved": n, "src": src}))
+                }
+                None => Some(json!({"success": false, "action": action, "error": "не в обходе"})),
+            }
+        }
+        "bypass-list" => Some(json!({
+            "success": true, "action": action,
+            "pids": bypass_members(),
+            "map": *bypass_map().lock().unwrap()
+        })),
+        "bypass-clear" => {
+            let groups: std::collections::HashMap<String, Vec<u32>> = {
+                let mut m = bypass_map().lock().unwrap();
+                let g: std::collections::HashMap<String, Vec<u32>> =
+                    m.drain().fold(Default::default(), |mut acc, (p, s)| {
+                        acc.entry(s).or_default().push(p); acc });
+                g
+            };
+            let mut n = 0;
+            for (src, pids) in groups {
+                let srcpath = format!("/sys/fs/cgroup{src}");
+                for p in pids {
+                    if std::path::Path::new(&format!("/proc/{p}")).exists()
+                        && std::fs::write(format!("{srcpath}/cgroup.procs"), format!("{p}\n")).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+            bypass_map_save();
+            Some(json!({"success": true, "action": action, "moved": n}))
+        }
         "shutdown" => {
             {
                 let mut p = procs.lock().unwrap();
@@ -649,6 +733,8 @@ fn tun_setup(spec: ProcSpec) {
         eprintln!("tun_setup: interface {iface} did not appear");
         return;
     }
+    // DNS-настройки прошлой сессии на omaxy0 ломают резолв имени сервера — откатить
+    let _ = Command::new("resolvectl").args(["revert", &iface]).status();
     // обход приватных/линк-локальных сетей — в main
     let lan = [
         "0.0.0.0/8",
@@ -665,18 +751,28 @@ fn tun_setup(spec: ProcSpec) {
         ip_cmd(&["rule", "del", "priority", &prio]);
         ip_cmd(&["rule", "add", "priority", &prio, "to", c, "lookup", "main"]);
     }
-    // обход адреса сервера (иначе петля)
-    if !server.is_empty() {
-        let host = server.split(':').next().unwrap_or("");
-        if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
-            for (i, a) in addrs.filter(|a| a.is_ipv4()).enumerate().take(8) {
-                let prio = format!("{}", 30500 + i);
-                ip_cmd(&["rule", "del", "priority", &prio]);
-                ip_cmd(&[
-                    "rule", "add", "priority", &prio,
-                    "to", &format!("{a}/32"), "lookup", "main",
-                ]);
+    // обход адреса сервера (иначе петля): сначала IP из CLI, потом свой резолв (×3)
+    {
+        let mut ips: Vec<String> = tun_get(&spec, "OMAXY_TUN_SERVER_IPS")
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+            .unwrap_or_default();
+        if ips.is_empty() && !server.is_empty() {
+            let host = server.split(':').next().unwrap_or("");
+            for _ in 0..3 {
+                if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+                    ips = addrs.filter(|a| a.is_ipv4()).map(|a| a.to_string()).collect();
+                    if !ips.is_empty() {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
+        }
+        for (i, a) in ips.iter().take(8).enumerate() {
+            let prio = format!("{}", 30500 + i);
+            ip_cmd(&["rule", "del", "priority", &prio]);
+            ip_cmd(&["rule", "add", "priority", &prio, "to", &format!("{a}/32"),
+                     "lookup", "main"]);
         }
     }
     // обход DNS-серверов: без этого xray не может разрешить имя своего сервера
@@ -705,6 +801,7 @@ fn tun_setup(spec: ProcSpec) {
             .args(["default-route", &iface, "yes"])
             .status();
     }
+    bypass_apply(); // обходы приложений живут поверх туннельного захвата
     eprintln!("tun: routing up on {iface}");
 }
 
@@ -712,6 +809,7 @@ fn tun_teardown(spec: &ProcSpec) {
     if tun_env(spec).is_none() {
         return;
     }
+    bypass_off();
     let iface = tun_get(spec, "OMAXY_TUN_IF").unwrap_or_else(|| "omaxy0".into());
     let server = tun_get(spec, "OMAXY_TUN_SERVER").unwrap_or_default();
     for i in 0..8 {
@@ -730,6 +828,95 @@ fn tun_teardown(spec: &ProcSpec) {
     ip_cmd(&["route", "flush", "table", "88"]);
     let _ = Command::new("resolvectl").args(["revert", &iface]).status();
     eprintln!("tun: routing down on {iface}");
+}
+
+
+// ---------- обход туннеля для выбранных приложений ----------
+// Приложение целиком (вся его systemd-scope) переносится в cgroup omaxy-bypass;
+// nft помечает its пакеты fwmark'ом, правило 30380 отправляет их в main (мимо 88).
+pub const BYPASS_CG: &str = "/sys/fs/cgroup/omaxy-bypass";
+const BYPASS_MARK: &str = "0x4b1";
+const BYPASS_PRIO: &str = "30380";
+const BYPASS_MAP: &str = "/var/lib/omaxy/bypass-map.json";
+
+fn bypass_map() -> &'static std::sync::Mutex<std::collections::HashMap<u32, String>> {
+    use std::sync::{Mutex, OnceLock};
+    static M: OnceLock<Mutex<std::collections::HashMap<u32, String>>> = OnceLock::new();
+    M.get_or_init(|| {
+        let map = std::fs::read_to_string(BYPASS_MAP)
+            .ok()
+            .and_then(|s| serde_json::from_str::<std::collections::HashMap<u32, String>>(&s).ok())
+            .unwrap_or_default();
+        Mutex::new(map)
+    })
+}
+
+fn bypass_map_save() {
+    if let Ok(s) = serde_json::to_string(&*bypass_map().lock().unwrap()) {
+        let _ = std::fs::write(BYPASS_MAP, s);
+    }
+}
+
+/// id cgroup = inode каталога (для nft meta cgroup)
+fn bypass_ino() -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::fs::create_dir(BYPASS_CG);
+    std::fs::metadata(BYPASS_CG).map(|m| m.ino()).unwrap_or(0)
+}
+
+fn bypass_apply() {
+    let ino = bypass_ino();
+    if ino == 0 {
+        return;
+    }
+    let ruleset = format!(
+        "table inet omaxy_bypass {{\n\tchain out {{\n\t\ttype filter hook output priority mangle; policy accept;\n\t\tmeta cgroup {ino} counter meta mark set {BYPASS_MARK}\n\t}}\n}}\n"
+    );
+    let _ = std::fs::write("/run/omaxy-bypass.nft", &ruleset);
+    let _ = Command::new("sh")
+        .args(["-c", "nft delete table inet omaxy_bypass 2>/dev/null; nft -f /run/omaxy-bypass.nft"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    ip_cmd(&["rule", "del", "priority", BYPASS_PRIO]);
+    ip_cmd(&["rule", "add", "priority", BYPASS_PRIO, "fwmark", BYPASS_MARK, "lookup", "main"]);
+}
+
+fn bypass_off() {
+    ip_cmd(&["rule", "del", "priority", BYPASS_PRIO]);
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", "omaxy_bypass"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// путь cgroup v2 процесса (0::/...)
+fn pid_cgroup(pid: u32) -> Option<String> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let p = s.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
+    if p == "/" || p.is_empty() { None } else { Some(p) }
+}
+
+/// перенести все процессы из cgroup `src` в dst (или в src при обратном); возвращает число
+fn bypass_move_all(src: &str, dst_cg: &str) -> usize {
+    let procs = std::path::Path::new(src).join("cgroup.procs");
+    let Ok(list) = std::fs::read_to_string(&procs) else { return 0 };
+    let mut n = 0;
+    for p in list.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+        if std::fs::write(format!("{dst_cg}/cgroup.procs"), format!("{p}\n")).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn bypass_members() -> Vec<u32> {
+    std::fs::read_to_string(format!("{BYPASS_CG}/cgroup.procs"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
 }
 
 use std::net::ToSocketAddrs;

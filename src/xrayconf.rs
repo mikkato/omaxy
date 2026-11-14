@@ -50,8 +50,9 @@ pub fn build(server: &Server, st: &Settings, with_tun: bool) -> Value {
 
     let mut rules: Vec<Value> = Vec::new();
     if with_tun {
-        rules.push(json!({"type":"field","inboundTag":["tun-in"],"outboundTag":"dns-out"}));
-        rules.push(json!({"type":"field","network":"udp","port":"53","outboundTag":"dns-out"}));
+        // только UDP:53; иначе весь TCP:443 из tun попадал в dns-out
+        rules.push(json!({"type":"field","inboundTag":["tun-in"],"network":"udp",
+                          "port":"53","outboundTag":"dns-out"}));
     }
     if st.route_mode != "global" {
         rules.push(json!({"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","::1/128","fc00::/7","fe80::/10"],"outboundTag":"direct"}));
@@ -230,21 +231,33 @@ fn build_outbound(server: &Server) -> Value {
             },
             "streamSettings": {"network":"tcp","sockopt":{"tcpNoDelay":true}}
         }),
-        ServerKind::Hysteria2 => {
-            let mut ss = stream_settings(server);
-            if let Some(obj) = ss.as_object_mut() {
-                obj.insert("network".into(), json!("hysteria2"));
-                let mut h2 = Map::new();
-                h2.insert("password".into(), json!(server.uuid));
-                h2.insert("disableMtuProbe".into(), json!(false));
-                obj.insert("hysteria2Settings".into(), Value::Object(h2));
+        ServerKind::Hysteria2 => json!({
+            // xray >=26: protocol "hysteria", version 2, auth в hysteriaSettings
+            "tag": "proxy",
+            "protocol": "hysteria",
+            "settings": {
+                "version": 2,
+                "address": server.address,
+                "port": server.port
+            },
+            "streamSettings": {
+                "network": "hysteria",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": server.sni.clone().unwrap_or_else(|| server.address.clone()),
+                    "alpn": ["h3"],
+                    "allowInsecure": server.insecure
+                },
+                "hysteriaSettings": {
+                    "version": 2,
+                    "auth": server.uuid
+                },
+                // провайдерский obfs salamander приезжает параметром fm (JSON xray)
+                "finalmask": server
+                    .finalmask
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
             }
-            json!({
-                "tag": "proxy",
-                "protocol": "freedom",
-                "settings": {"domainStrategy": "UseIP", "redirect": ""},
-                "streamSettings": ss
-            })
-        }
+        }),
     }
 }
