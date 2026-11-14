@@ -54,7 +54,7 @@ max-restart-attempts, restart-delay-ms` + **расширение `detached:true`
 - [x] подписки (base64-список / JSON)
 - [x] декод ссылок из QR-картинки (`omaxy qr`)
 - [x] QML-модуль панели Omarchy
-- [ ] GUI omaxy-gui (Slint)
+- [x] GUI omaxy-gui (Slint, тёмная тема, Wayland-нативный)
 - [ ] конфиг-генерация hysteria2, routing-правила geosite, per-app routing
 
 ## Лицензия
