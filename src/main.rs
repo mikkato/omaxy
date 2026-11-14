@@ -456,6 +456,16 @@ fn cli_ping(args: &[String]) -> Result<(), String> {
         None => cfg.active.as_ref().and_then(|a| cfg.find_server(a).cloned()),
     }
     .ok_or("сервер не найден; список: omaxy server list")?;
+    // Hysteria2 — только QUIC/UDP: TCP-коннект к её порту заведомо невозможен,
+    // показываем «n/a» вместо ложной смерти
+    if server.kind == links::ServerKind::Hysteria2 {
+        if json_out {
+            println!("{}", json!({"id": server.id, "ok": false, "na": true, "proto": "hy2"}));
+        } else {
+            println!("{}:{}: hy2 (QUIC/UDP) — TCP-пинг неприменим", server.address, server.port);
+        }
+        return Ok(());
+    }
     let target = format!("{}:{}", server.address, server.port);
     let addrs: Vec<std::net::SocketAddr> = {
         use std::net::ToSocketAddrs;
@@ -716,6 +726,11 @@ fn cli_ping_all() -> Result<(), String> {
         thread::spawn(move || {
             for s in chunk {
                 let mut out = json!({"id": s.id, "ok": false, "min_ms": null});
+                if s.kind == links::ServerKind::Hysteria2 {
+                    out["na"] = json!(true); out["proto"] = json!("hy2");
+                    let _ = tx.send(out);
+                    continue;
+                }
                 let target = format!("{}:{}", s.address, s.port);
                 use std::net::ToSocketAddrs;
                 if let Some(addr) = target.to_socket_addrs().ok().and_then(|mut a| a.next()) {

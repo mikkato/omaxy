@@ -154,7 +154,8 @@ Panel {
     try { arr = JSON.parse(String(text || "[]")) } catch (e) { }
     var p = Object.assign({}, root.pings)
     for (var i = 0; i < arr.length; i++)
-      p[arr[i].id] = { busy: false, ms: arr[i].ok === true ? arr[i].min_ms : -1 }
+      p[arr[i].id] = { busy: false, ms: arr[i].ok === true ? arr[i].min_ms
+                             : (arr[i].na === true ? -2 : -1) }
     root.pings = p
     root.pingAllBusy = false
   }
@@ -293,7 +294,8 @@ Panel {
       onStreamFinished: {
         var r = {}
         try { r = JSON.parse(String(text || "{}")) } catch (e) { }
-        var ms = r.ok === true ? (r.min_ms !== undefined ? r.min_ms : -1) : -1
+        var ms = r.ok === true ? (r.min_ms !== undefined ? r.min_ms : -1)
+                               : (r.na === true ? -2 : -1)
         root.setPing(root.pingCurrent, { busy: false, ms: ms })
       }
     }
@@ -1064,12 +1066,14 @@ Panel {
                     var p = parent.parent.ping
                     if (p === undefined) return ""
                     if (p.busy === true) return "…"
+                    if (p.ms === -2) return "UDP"
                     if (p.ms < 0) return "×"
                     return p.ms + " мс"
                   }
                   color: {
                     var p = parent.parent.ping
                     if (p === undefined || p.busy === true) return Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.55)
+                    if (p.ms === -2) return Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.6)
                     if (p.ms < 0) return Qt.rgba(0.95, 0.4, 0.35, 0.9)
                     if (p.ms <= 80) return Qt.rgba(0.45, 0.85, 0.5, 0.95)
                     if (p.ms <= 200) return Qt.rgba(0.95, 0.75, 0.35, 0.95)
