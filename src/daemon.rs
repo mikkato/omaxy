@@ -68,6 +68,13 @@ impl Daemon {
         if !bypass_members().is_empty() {
             bypass_apply();
         }
+        // зачистить унаследованные от прошлых прогонов DNS-директивы на туннеле
+        let _ = std::process::Command::new("resolvectl").args(["revert", "omaxy0"]).status();
+        // наблюдатель: новые процессы приложений из watch-списка сами уходят в обход
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            bypass_watch_sweep();
+        });
         // при старте убираем osиротевший xray от прошлых жизней (иначе "device busy")
         let _ = std::process::Command::new("pkill")
             .args(["-9", "-f", "xray run -c /var/lib/omaxy/"])
@@ -359,6 +366,11 @@ fn handle_action(
                     Some(json!({"success": true, "action": action, "moved": 0, "note": "already"})),
                 Some(src) => {
                     bypass_apply(); // каталог-приёмник должен существовать до переноса
+                    let exe = proc_exe_name(pid);
+                    if !exe.is_empty() {
+                        bypass_watch().lock().unwrap().insert(exe);
+                        bypass_watch_save();
+                    }
                     let srcpath = format!("/sys/fs/cgroup{src}");
                     let pre: Vec<u32> = std::fs::read_to_string(format!("{srcpath}/cgroup.procs"))
                         .unwrap_or_default().lines()
@@ -375,7 +387,14 @@ fn handle_action(
             }
         }
 "bypass-remove" => {
-            let pid = msg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let pid = msg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    {
+        let exe = proc_exe_name(pid);
+        if !exe.is_empty() {
+            bypass_watch().lock().unwrap().remove(&exe);
+            bypass_watch_save();
+        }
+    }
             let src = {
                 let m = bypass_map().lock().unwrap();
                 m.get(&pid).cloned().or_else(|| {
@@ -408,9 +427,12 @@ fn handle_action(
         "bypass-list" => Some(json!({
             "success": true, "action": action,
             "pids": bypass_members(),
+            "watch": bypass_watch().lock().unwrap().iter().cloned().collect::<Vec<_>>(),
             "map": *bypass_map().lock().unwrap()
         })),
         "bypass-clear" => {
+            bypass_watch().lock().unwrap().clear();
+            bypass_watch_save();
             let groups: std::collections::HashMap<String, Vec<u32>> = {
                 let mut m = bypass_map().lock().unwrap();
                 let g: std::collections::HashMap<String, Vec<u32>> =
@@ -789,17 +811,10 @@ fn tun_setup(spec: ProcSpec) {
     ip_cmd(&["route", "replace", "default", "dev", &iface, "table", "88"]);
     ip_cmd(&["rule", "del", "priority", "31000"]);
     ip_cmd(&["rule", "add", "priority", "31000", "from", "all", "lookup", "88"]);
-    if !dns.is_empty() {
-        let mut a: Vec<String> = vec!["dns".into(), iface.clone()];
-        a.extend(dns.split(',').map(|s| s.trim().to_string()));
-        let _ = Command::new("resolvectl").args(&a).status();
-        let _ = Command::new("resolvectl")
-            .args(["domain", &iface, "~."])
-            .status();
-        let _ = Command::new("resolvectl")
-            .args(["default-route", &iface, "yes"])
-            .status();
-    }
+    // Никаких resolvectl default-route/~. на туннель: это загоняет весь системный
+    // DNS внутрь туннеля, и при его деградации встаёт резолв у ВСЕХ процессов,
+    // включая обходящие туннель. DNS из туннеля обслуживает xray (dns-out),
+    // а наружу resolved ходит напрямую по правилам 30450.
     bypass_apply(); // обходы приложений живут поверх туннельного захвата
     eprintln!("tun: routing up on {iface}");
 }
@@ -840,6 +855,7 @@ pub const BYPASS_CG: &str = "/sys/fs/cgroup/omaxy-bypass";
 const BYPASS_MARK: &str = "0x4b1";
 const BYPASS_PRIO: &str = "30380";
 const BYPASS_MAP: &str = "/var/lib/omaxy/bypass-map.json";
+const BYPASS_WATCH: &str = "/var/lib/omaxy/bypass-watch.json";
 
 fn bypass_map() -> &'static std::sync::Mutex<std::collections::HashMap<u32, String>> {
     use std::sync::{Mutex, OnceLock};
@@ -956,6 +972,60 @@ fn bypass_put_back(p: u32, src: &str) -> bool {
     let cg = bypass_restore_cg(proc_uid(p));
     let _ = std::fs::create_dir_all(&cg);
     std::fs::write(format!("{cg}/cgroup.procs"), format!("{p}\n")).is_ok()
+}
+
+/// имена exe, за которыми следим: новые процессы этих программ сами уходят в обход
+fn bypass_watch() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    use std::sync::{Mutex, OnceLock};
+    static M: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    M.get_or_init(|| {
+        let s = std::fs::read_to_string(BYPASS_WATCH).ok()
+            .and_then(|f| serde_json::from_str::<Vec<String>>(&f).ok())
+            .unwrap_or_default();
+        Mutex::new(s.into_iter().collect())
+    })
+}
+
+fn bypass_watch_save() {
+    if let Ok(s) = serde_json::to_string(&bypass_watch().lock().unwrap().iter().cloned()
+        .collect::<Vec<_>>()) {
+        let _ = std::fs::write(BYPASS_WATCH, s);
+    }
+}
+
+fn proc_exe_name(p: u32) -> String {
+    std::fs::read_link(format!("/proc/{p}/exe")).ok()
+        .and_then(|x| x.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// один проход наблюдателя: процессы из watch-списка, не в обходе — переносим в обход
+fn bypass_watch_sweep() {
+    let watch = bypass_watch().lock().unwrap().clone();
+    if watch.is_empty() {
+        return;
+    }
+    let skip = ancestor_pids(std::process::id());
+    let Ok(rd) = std::fs::read_dir("/proc") else { return };
+    for e in rd.flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if skip.contains(&pid) { continue }
+        if !watch.contains(&proc_exe_name(pid)) { continue }
+        let Some(cg) = pid_cgroup(pid) else { continue };
+        if cg.starts_with("/omaxy-bypass") { continue }
+        // переносим весь scope процесса (как при ручном добавлении)
+        let srcpath = format!("/sys/fs/cgroup{cg}");
+        let pre: Vec<u32> = std::fs::read_to_string(format!("{srcpath}/cgroup.procs"))
+            .unwrap_or_default().lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok()).collect();
+        if bypass_move_all(&srcpath, BYPASS_CG) > 0 {
+            let mut m = bypass_map().lock().unwrap();
+            for p in pre { m.entry(p).or_insert_with(|| cg.clone()); }
+            drop(m);
+            bypass_map_save();
+            eprintln!("bypass-watch: {pid} из {cg} -> обход");
+        }
+    }
 }
 
 fn bypass_members() -> Vec<u32> {
