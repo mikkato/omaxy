@@ -589,8 +589,11 @@ Panel {
           id: stopDaemonBtn
           anchors.left: pingActiveBtn.right
           anchors.leftMargin: Style.space(6)
+          anchors.right: parent.right          // не вылезаем за правый край панели
+          anchors.rightMargin: Style.space(2)
           anchors.verticalCenter: parent.verticalCenter
           visible: root.daemonUp
+          clip: true
           // короткий текст: кнопка в плотном ряду, длинная фраза вылезала за ряд
           text: root.confirmStopDaemon ? "⏻ ещё раз" : "⏻ стоп"
           fontSize: Style.font.bodySmall
